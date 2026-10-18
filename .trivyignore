@@ -1,0 +1,3 @@
+# Trivy allowlist, used by `make scan-fs`.
+# Add an ID only after confirming it is a false positive or an accepted risk,
+# with the reason on the line above it.
