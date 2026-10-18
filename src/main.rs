@@ -53,9 +53,9 @@ struct DisplayArgs {
     #[arg(long)]
     hidpi: bool,
 
-    /// Refresh rate in Hz.
-    #[arg(long, default_value_t = 60.0)]
-    refresh: f64,
+    /// Refresh rate in Hz. Default: the refresh rate of the --view screen, else 60.
+    #[arg(long)]
+    refresh: Option<f64>,
 
     /// Pixel density used to report the physical size (default: 109, or 218 with --hidpi).
     #[arg(long)]
@@ -229,9 +229,11 @@ fn install_ctrlc() -> Result<Arc<AtomicBool>> {
 fn wait_loop(stop: &AtomicBool, session: &mut Session, keep_going: impl Fn() -> bool) {
     while !stop.load(Ordering::SeqCst) && keep_going() {
         match session.viewer.as_mut() {
-            // Short steps: the pointer handoff has to keep up with the mouse.
+            // Short steps: the pointer handoff has to keep up with the mouse,
+            // and while the pointer is in the viewer it is drawn every tick.
             Some(viewer) => {
-                objc::pump(Duration::from_millis(8));
+                let step = if viewer.pointer_inside() { 4 } else { 8 };
+                objc::pump(Duration::from_millis(step));
                 viewer.tick();
             }
             None => objc::pump(Duration::from_millis(500)),
@@ -273,15 +275,30 @@ fn setup_display(d: &DisplayArgs, stop: &AtomicBool) -> Result<Session> {
         }
         (None, None) => Resolution { w: 3840, h: 2160 },
     };
-    let cfg = DisplayConfig {
+    let view_hz = view.and_then(|(on, _)| {
+        vdisplay::list_displays()
+            .into_iter()
+            .find(|i| i.id == on)
+            .map(|i| i.refresh)
+    });
+    let mut cfg = DisplayConfig {
         name: d.name.clone(),
         width: res.w,
         height: res.h,
-        refresh: d.refresh,
+        refresh: layout::refresh_rate(d.refresh, view_hz),
         hidpi,
         ppi: d.ppi.unwrap_or(if hidpi { 218.0 } else { 109.0 }),
     };
-    let vd = VirtualDisplay::create(&cfg)?;
+    let vd = match VirtualDisplay::create(&cfg) {
+        // A rate picked from the screen may be one the virtual display
+        // rejects; 60 Hz always works.
+        Err(e) if d.refresh.is_none() && cfg.refresh != 60.0 => {
+            eprintln!("note: {} Hz not accepted ({e:#}); using 60 Hz", cfg.refresh);
+            cfg.refresh = 60.0;
+            VirtualDisplay::create(&cfg)?
+        }
+        r => r?,
+    };
     vd.wait_online(Duration::from_secs(10))?;
     let scale = if hidpi { 2 } else { 1 };
     println!(
@@ -334,7 +351,7 @@ fn setup_display(d: &DisplayArgs, stop: &AtomicBool) -> Result<Session> {
         (Some((on, area)), Some(name)) => {
             let rect = layout::fit(area, cfg.width as f64, cfg.height as f64);
             let pixels = (cfg.width * scale, cfg.height * scale);
-            let viewer = viewer::Viewer::start(vd.id, pixels, rect)?;
+            let viewer = viewer::Viewer::start(vd.id, pixels, rect, cfg.refresh)?;
             println!(
                 "Showing it on the {} of display {on} ({}x{} at {},{}); move the pointer there to use it",
                 name.name(),

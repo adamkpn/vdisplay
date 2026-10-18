@@ -219,6 +219,13 @@ pub const kCMTimeFlags_Valid: u32 = 1;
 #[cfg_attr(target_os = "macos", link(name = "CoreMedia", kind = "framework"))]
 extern "C" {
     pub fn CMSampleBufferGetImageBuffer(sample: *const c_void) -> *const c_void;
+    pub fn CMSampleBufferGetPresentationTimeStamp(sample: *const c_void) -> CMTime;
+}
+
+#[cfg_attr(target_os = "macos", link(name = "QuartzCore", kind = "framework"))]
+extern "C" {
+    /// Host time in seconds, the clock ScreenCaptureKit timestamps use.
+    pub fn CACurrentMediaTime() -> f64;
 }
 
 #[cfg_attr(target_os = "macos", link(name = "CoreVideo", kind = "framework"))]
@@ -228,14 +235,27 @@ extern "C" {
 
 // ------------------------------------------------------ libdispatch / libc
 pub const RTLD_NOW: i32 = 2;
+/// `RTLD_DEFAULT` on macOS: search every loaded image.
+pub const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+pub const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
 
 extern "C" {
     /// `dispatch_get_main_queue()` is a macro for `&_dispatch_main_q`.
     pub static _dispatch_main_q: Opaque;
+    /// `attr` null = DISPATCH_QUEUE_SERIAL.
+    pub fn dispatch_queue_attr_make_with_qos_class(
+        attr: *const c_void,
+        qos_class: u32,
+        relative_priority: i32,
+    ) -> *const c_void;
+    pub fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> Id;
+    pub fn dispatch_sync_f(queue: Id, context: *mut c_void, work: extern "C" fn(*mut c_void));
+    pub fn dispatch_release(object: Id);
     /// isa of a global (static, never copied) Objective-C block.
     pub static _NSConcreteGlobalBlock: Opaque;
     pub fn kill(pid: i32, sig: i32) -> i32;
     pub fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
+    pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
 
 pub fn dispatch_main_queue() -> Id {

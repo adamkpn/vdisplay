@@ -14,13 +14,90 @@ use std::ffi::{c_void, CString};
 use std::mem::size_of;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// Layer the frames are drawn into; null when no viewer is open.
+/// Layer the frames are drawn into (only ever touched on the frame queue and
+/// in `Drop`); null when no viewer is open.
 static LAYER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 /// Last IOSurface shown, to force a redraw when ScreenCaptureKit reuses one.
 static LAST_SURFACE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// `VDISPLAY_STATS=1`: report frame rate, latency and loop gaps every 2 s.
+static STATS: AtomicBool = AtomicBool::new(false);
+/// Capture-to-viewer latency of the frames in the current stats window, in µs.
+static LATENCY_SUM_US: AtomicU64 = AtomicU64::new(0);
+static LATENCY_MAX_US: AtomicU64 = AtomicU64::new(0);
+const STATS_EVERY: Duration = Duration::from_secs(2);
+
+/// Main-loop side of the stats (only touched on the main thread).
+struct Stats {
+    /// False until the first tick: startup (placing the app's window) runs
+    /// without ticks and would show up as one long gap.
+    running: bool,
+    since: Instant,
+    frames_at_start: u64,
+    last_tick: Instant,
+    max_gap: Duration,
+    /// Longest time vdisplay itself spent in one tick (pointer handoff and
+    /// drawing); the rest of a gap is the event loop or the system.
+    max_work: Duration,
+}
+
+impl Stats {
+    fn new() -> Self {
+        let now = Instant::now();
+        Stats {
+            running: false,
+            since: now,
+            frames_at_start: FRAMES.load(Ordering::SeqCst),
+            last_tick: now,
+            max_gap: Duration::ZERO,
+            max_work: Duration::ZERO,
+        }
+    }
+
+    /// Records a tick; prints and resets once per `STATS_EVERY`.
+    fn tick(&mut self) {
+        if !self.running {
+            LATENCY_SUM_US.store(0, Ordering::SeqCst);
+            LATENCY_MAX_US.store(0, Ordering::SeqCst);
+            *self = Stats {
+                running: true,
+                ..Stats::new()
+            };
+            return;
+        }
+        let now = Instant::now();
+        self.max_gap = self.max_gap.max(now - self.last_tick);
+        self.last_tick = now;
+        let elapsed = now - self.since;
+        if elapsed < STATS_EVERY {
+            return;
+        }
+        let frames = FRAMES.load(Ordering::SeqCst) - self.frames_at_start;
+        let sum = LATENCY_SUM_US.swap(0, Ordering::SeqCst);
+        let max = LATENCY_MAX_US.swap(0, Ordering::SeqCst);
+        let avg_ms = if frames == 0 {
+            0.0
+        } else {
+            sum as f64 / frames as f64 / 1000.0
+        };
+        eprintln!(
+            "stats: {:5.1} fps captured | capture->viewer latency avg {:4.1} ms, max {:4.1} ms | main loop max gap {:4.1} ms (tick work max {:4.1} ms)",
+            frames as f64 / elapsed.as_secs_f64(),
+            avg_ms,
+            max as f64 / 1000.0,
+            self.max_gap.as_secs_f64() * 1000.0,
+            self.max_work.as_secs_f64() * 1000.0
+        );
+        *self = Stats {
+            running: true,
+            ..Stats::new()
+        };
+    }
+}
 
 /// Where the real pointer is, and its last known position.
 #[derive(Clone, Copy, Debug)]
@@ -31,20 +108,68 @@ enum Pointer {
     Inside(CGPoint),
 }
 
+/// NSActivityUserInitiated | NSActivityLatencyCritical: no App Nap and no timer
+/// coalescing for a background process, so frames and the pointer stay on time.
+const ACTIVITY_OPTIONS: u64 = 0x00FF_FFFF | 0xFF_0000_0000;
+/// Without `CGSCurrentCursorSeed`, how often the pointer's shape is re-read.
+const POINTER_SHAPE_FALLBACK_EVERY: Duration = Duration::from_millis(250);
+
+/// `CGSCurrentCursorSeed` (private, CoreGraphics): a counter that changes
+/// whenever the pointer's shape does, read from shared memory. Asking for the
+/// shape itself (`currentSystemCursor`) is a window-server round trip that
+/// takes 3-40 ms about one call in seven, so it is only done on a change.
+fn cursor_seed() -> Option<i32> {
+    static SEED: OnceLock<Option<extern "C" fn() -> i32>> = OnceLock::new();
+    let seed = SEED.get_or_init(|| unsafe {
+        let name = CString::new("CGSCurrentCursorSeed").ok()?;
+        let f = dlsym(RTLD_DEFAULT, name.as_ptr());
+        (!f.is_null()).then(|| std::mem::transmute::<*mut c_void, extern "C" fn() -> i32>(f))
+    });
+    seed.map(|f| f())
+}
+
+/// The pointer drawn over the frames while the real one is on the virtual
+/// display. Drawn here, it follows the hand at the loop's rate instead of
+/// arriving with each captured frame.
+struct PointerLayer {
+    layer: Id,
+    shown: bool,
+    frame: CGRect,
+    hot_spot: CGPoint,
+    size: CGSize,
+    /// `cursor_seed()` when the shape was last read.
+    shape_seed: Option<i32>,
+    shape_read: Option<Instant>,
+}
+
 pub struct Viewer {
     window: Id,
     stream: Id,
     output: Id,
+    /// Serial user-interactive queue frames are delivered and drawn on, so a
+    /// busy main loop can't hold them back.
+    frame_queue: Id,
+    /// Sublayer showing the frames (+1 retained).
+    frames_layer: Id,
+    /// Token from `beginActivityWithOptions:reason:`.
+    activity: Id,
+    pointer_layer: PointerLayer,
     /// The window's content, in global CoreGraphics coordinates.
     rect: CGRect,
     display: CGDirectDisplayID,
     pointer: Pointer,
+    stats: Option<Stats>,
 }
 
 impl Viewer {
     /// Shows virtual display `display` (`pixels` = its backing size) in a
-    /// window covering `rect`.
-    pub fn start(display: CGDirectDisplayID, pixels: (u32, u32), rect: CGRect) -> Result<Self> {
+    /// window covering `rect`, capturing up to `fps` frames per second.
+    pub fn start(
+        display: CGDirectDisplayID,
+        pixels: (u32, u32),
+        rect: CGRect,
+        fps: f64,
+    ) -> Result<Self> {
         unsafe {
             if !CGPreflightScreenCaptureAccess() {
                 CGRequestScreenCaptureAccess();
@@ -68,16 +193,45 @@ impl Viewer {
             msg![(); app, "finishLaunching"];
             set_event_app(app);
 
+            let info: Id =
+                msg![Id; class("NSProcessInfo").context("NSProcessInfo missing")?, "processInfo"];
+            let reason = CfStr::new("vdisplay live view");
+            let activity: Id = msg![Id; info, "beginActivityWithOptions:reason:",
+                ACTIVITY_OPTIONS => u64, reason.as_id() => Id];
+            let activity = if activity.is_null() {
+                activity
+            } else {
+                msg![Id; activity, "retain"]
+            };
+
+            let label = CString::new("vdisplay.frames")?;
+            let attr =
+                dispatch_queue_attr_make_with_qos_class(ptr::null(), QOS_CLASS_USER_INTERACTIVE, 0);
+            let frame_queue = dispatch_queue_create(label.as_ptr(), attr);
+            let (window, frames_layer, pointer_layer) = create_window(rect)?;
             let mut viewer = Viewer {
-                window: create_window(rect)?,
+                window,
                 stream: ptr::null_mut(),
                 output: ptr::null_mut(),
+                frame_queue,
+                frames_layer,
+                activity,
+                pointer_layer: PointerLayer {
+                    layer: pointer_layer,
+                    shown: false,
+                    frame: CGRect::default(),
+                    hot_spot: CGPoint::default(),
+                    size: CGSize::default(),
+                    shape_seed: None,
+                    shape_read: None,
+                },
                 rect,
                 display,
                 pointer: Pointer::Outside(mouse_location()),
+                stats: None,
             };
             let sc_display = find_sc_display(display)?;
-            let started = start_stream(sc_display, pixels);
+            let started = start_stream(sc_display, pixels, fps, frame_queue);
             release(sc_display);
             (viewer.stream, viewer.output) = started?;
 
@@ -91,6 +245,11 @@ impl Viewer {
                      check Screen Recording permission for your terminal."
                 );
             }
+            if std::env::var("VDISPLAY_STATS").is_ok_and(|v| !v.is_empty() && v != "0") {
+                STATS.store(true, Ordering::SeqCst);
+                viewer.stats = Some(Stats::new());
+                eprintln!("stats: on (fps counts changed frames only; an idle page reads ~0)");
+            }
             Ok(viewer)
         }
     }
@@ -98,6 +257,10 @@ impl Viewer {
     /// Moves the pointer between the viewer and the virtual display. Call it
     /// every few milliseconds.
     pub fn tick(&mut self) {
+        if let Some(stats) = self.stats.as_mut() {
+            stats.tick();
+        }
+        let work = Instant::now();
         let p = mouse_location();
         let virt = unsafe { CGDisplayBounds(self.display) };
         self.pointer = match self.pointer {
@@ -132,6 +295,101 @@ impl Viewer {
                 }
             }
         };
+        match self.pointer {
+            Pointer::Inside(v) => self.draw_pointer(layout::map_point(virt, self.rect, v)),
+            Pointer::Outside(_) => self.hide_pointer(),
+        }
+        if let Some(stats) = self.stats.as_mut() {
+            stats.max_work = stats.max_work.max(work.elapsed());
+        }
+    }
+
+    /// Whether the real pointer is on the virtual display (over the viewer).
+    pub fn pointer_inside(&self) -> bool {
+        matches!(self.pointer, Pointer::Inside(_))
+    }
+
+    /// Shows the pointer at `at` (global coordinates inside the viewer).
+    fn draw_pointer(&mut self, at: CGPoint) {
+        let _pool = AutoreleasePool::new();
+        let Some(tx) = class("CATransaction") else {
+            return;
+        };
+        let pl = &mut self.pointer_layer;
+        unsafe {
+            msg![(); tx, "begin"];
+            msg![(); tx, "setDisableActions:", 1i8 => i8];
+            // The app under the pointer sets its shape (arrow, I-beam, hand).
+            let seed = cursor_seed();
+            let stale = match seed {
+                Some(_) => pl.shape_seed != seed,
+                None => pl
+                    .shape_read
+                    .is_none_or(|t| t.elapsed() >= POINTER_SHAPE_FALLBACK_EVERY),
+            };
+            if stale {
+                pl.shape_seed = seed;
+                pl.shape_read = Some(Instant::now());
+                let cursor: Id = match class("NSCursor") {
+                    Some(c) => msg![Id; c, "currentSystemCursor"],
+                    None => ptr::null_mut(),
+                };
+                let image: Id = if cursor.is_null() {
+                    ptr::null_mut()
+                } else {
+                    msg![Id; cursor, "image"]
+                };
+                if !image.is_null() {
+                    let cg: Id = msg![Id; image, "CGImageForProposedRect:context:hints:",
+                        ptr::null_mut::<CGRect>() => *mut CGRect,
+                        ptr::null_mut::<c_void>() => Id,
+                        ptr::null_mut::<c_void>() => Id];
+                    if !cg.is_null() {
+                        msg![(); pl.layer, "setContents:", cg => Id];
+                        pl.hot_spot = msg![CGPoint; cursor, "hotSpot"];
+                        pl.size = msg![CGSize; image, "size"];
+                    }
+                }
+            }
+            // Layer coordinates run bottom-up; the hot spot is measured from
+            // the image's top-left corner.
+            let (x, y) = (at.x - self.rect.origin.x, at.y - self.rect.origin.y);
+            let frame = CGRect {
+                origin: CGPoint {
+                    x: x - pl.hot_spot.x,
+                    y: self.rect.size.height - y - (pl.size.height - pl.hot_spot.y),
+                },
+                size: pl.size,
+            };
+            if frame != pl.frame {
+                msg![(); pl.layer, "setFrame:", frame => CGRect];
+                pl.frame = frame;
+            }
+            if !pl.shown {
+                msg![(); pl.layer, "setHidden:", 0i8 => i8];
+                pl.shown = true;
+            }
+            msg![(); tx, "commit"];
+        }
+    }
+
+    fn hide_pointer(&mut self) {
+        let pl = &mut self.pointer_layer;
+        if !pl.shown {
+            return;
+        }
+        if let Some(tx) = class("CATransaction") {
+            unsafe {
+                msg![(); tx, "begin"];
+                msg![(); tx, "setDisableActions:", 1i8 => i8];
+                msg![(); pl.layer, "setHidden:", 1i8 => i8];
+                msg![(); tx, "commit"];
+            }
+        }
+        pl.shown = false;
+        // Re-read the shape on the next entry.
+        pl.shape_seed = None;
+        pl.shape_read = None;
     }
 
     /// Warps to `target` if it is on a real screen outside the viewer.
@@ -161,10 +419,27 @@ impl Drop for Viewer {
             LAYER.store(ptr::null_mut(), Ordering::SeqCst);
             if !self.stream.is_null() {
                 msg![(); self.stream, "stopCaptureWithCompletionHandler:", ptr::null_mut::<c_void>() => Id];
-                pump(Duration::from_millis(200)); // let queued frames drain
+                pump(Duration::from_millis(200)); // let the stop settle
+            }
+            // Wait out a frame that is being drawn right now: the layers
+            // below must outlive it.
+            if !self.frame_queue.is_null() {
+                dispatch_sync_f(self.frame_queue, ptr::null_mut(), drained);
             }
             release(self.stream);
             release(self.output);
+            release(self.frames_layer);
+            release(self.pointer_layer.layer);
+            if !self.frame_queue.is_null() {
+                dispatch_release(self.frame_queue);
+            }
+            if !self.activity.is_null() {
+                if let Some(info) = class("NSProcessInfo") {
+                    let info: Id = msg![Id; info, "processInfo"];
+                    msg![(); info, "endActivity:", self.activity => Id];
+                }
+                release(self.activity);
+            }
             if !self.window.is_null() {
                 msg![(); self.window, "orderOut:", ptr::null_mut::<c_void>() => Id];
                 release(self.window);
@@ -193,9 +468,10 @@ fn warp(p: CGPoint) {
     }
 }
 
-/// Borderless, shadowless window over `rect` that draws its layer's contents
-/// scaled to fit. Shown without activating vdisplay.
-unsafe fn create_window(rect: CGRect) -> Result<Id> {
+/// Borderless, shadowless window over `rect` with two sublayers (both +1
+/// retained): one showing the frames scaled to fit, and a hidden one above it
+/// for the pointer. Shown without activating vdisplay.
+unsafe fn create_window(rect: CGRect) -> Result<(Id, Id, Id)> {
     let main_h = CGDisplayBounds(CGMainDisplayID()).size.height;
     let frame = CGRect {
         origin: CGPoint {
@@ -218,12 +494,36 @@ unsafe fn create_window(rect: CGRect) -> Result<Id> {
     let view: Id = msg![Id; window, "contentView"];
     msg![(); view, "setWantsLayer:", 1i8 => i8];
     let layer: Id = msg![Id; view, "layer"];
+    let scale: f64 = msg![f64; window, "backingScaleFactor"];
+    let layer_cls = class("CALayer").context("CALayer missing")?;
+
+    // An own layer, not the view's: AppKit expects its layers to be changed on
+    // the main thread only, and frames are drawn on the frame queue.
+    let frames = alloc_init(layer_cls);
+    let bounds = CGRect {
+        origin: CGPoint::default(),
+        size: rect.size,
+    };
+    msg![(); frames, "setFrame:", bounds => CGRect];
+    const WIDTH_AND_HEIGHT_SIZABLE: u32 = 2 | 16; // kCALayerWidthSizable | kCALayerHeightSizable
+    msg![(); frames, "setAutoresizingMask:", WIDTH_AND_HEIGHT_SIZABLE => u32];
     let gravity = CfStr::new("resizeAspect");
-    msg![(); layer, "setContentsGravity:", gravity.as_id() => Id];
-    LAYER.store(layer, Ordering::SeqCst);
+    msg![(); frames, "setContentsGravity:", gravity.as_id() => Id];
+    msg![(); frames, "setContentsScale:", scale => f64];
+    msg![(); layer, "addSublayer:", frames => Id];
+    LAYER.store(frames, Ordering::SeqCst);
+
+    let pointer = alloc_init(layer_cls);
+    msg![(); pointer, "setHidden:", 1i8 => i8];
+    msg![(); pointer, "setContentsScale:", scale => f64];
+    msg![(); layer, "addSublayer:", pointer => Id];
+
     msg![(); window, "orderFrontRegardless"];
-    Ok(window)
+    Ok((window, frames, pointer))
 }
+
+/// No-op run on the frame queue by `Drop` to wait for in-flight frames.
+extern "C" fn drained(_: *mut c_void) {}
 
 // ------------------------------------------------------------ ScreenCaptureKit
 
@@ -294,9 +594,14 @@ unsafe fn shareable_content() -> Result<Id> {
     Ok(content)
 }
 
-/// Starts capturing `sc_display` at `pixels`, frames delivered on the main
-/// queue. Returns the stream and its output object (both +1 retained).
-unsafe fn start_stream(sc_display: Id, pixels: (u32, u32)) -> Result<(Id, Id)> {
+/// Starts capturing `sc_display` at `pixels` and up to `fps`, frames delivered
+/// on `queue`. Returns the stream and its output object (both +1 retained).
+unsafe fn start_stream(
+    sc_display: Id,
+    pixels: (u32, u32),
+    fps: f64,
+    queue: Id,
+) -> Result<(Id, Id)> {
     let empty: Id = msg![Id; class("NSArray").context("NSArray missing")?, "array"];
     let filter: Id = msg![Id; msg![Id; class("SCContentFilter").context("SCContentFilter missing")?, "alloc"],
         "initWithDisplay:excludingWindows:", sc_display => Id, empty => Id];
@@ -305,11 +610,13 @@ unsafe fn start_stream(sc_display: Id, pixels: (u32, u32)) -> Result<(Id, Id)> {
     msg![(); config, "setWidth:", pixels.0 as usize => usize];
     msg![(); config, "setHeight:", pixels.1 as usize => usize];
     msg![(); config, "setPixelFormat:", u32::from_be_bytes(*b"BGRA") => u32];
-    msg![(); config, "setShowsCursor:", 1i8 => i8];
+    // The viewer draws the pointer itself (see `Viewer::draw_pointer`): one
+    // baked into the frames would trail the hand by the whole capture delay.
+    msg![(); config, "setShowsCursor:", 0i8 => i8];
     msg![(); config, "setQueueDepth:", 5isize => isize];
     let interval = CMTime {
         value: 1,
-        timescale: 60,
+        timescale: fps.round().max(1.0) as i32,
         flags: kCMTimeFlags_Valid,
         epoch: 0,
     };
@@ -325,7 +632,7 @@ unsafe fn start_stream(sc_display: Id, pixels: (u32, u32)) -> Result<(Id, Id)> {
     let output = alloc_init(output_class()?);
     let mut err: Id = ptr::null_mut();
     let ok: i8 = msg![i8; stream, "addStreamOutput:type:sampleHandlerQueue:error:",
-        output => Id, 0isize => isize, dispatch_main_queue() => Id, &mut err as *mut Id => *mut Id];
+        output => Id, 0isize => isize, queue => Id, &mut err as *mut Id => *mut Id];
     if ok == 0 {
         let reason = if err.is_null() {
             "unknown error".to_string()
@@ -371,7 +678,9 @@ unsafe fn output_class() -> Result<Id> {
     Ok(cls)
 }
 
-/// `-[SCStreamOutput stream:didOutputSampleBuffer:ofType:]`, on the main queue.
+/// `-[SCStreamOutput stream:didOutputSampleBuffer:ofType:]`, on the frame
+/// queue. Core Animation allows this off the main thread inside an explicit
+/// transaction, on a layer AppKit doesn't manage.
 unsafe extern "C" fn did_output(
     _this: Id,
     _cmd: Sel,
@@ -403,7 +712,18 @@ unsafe extern "C" fn did_output(
         msg![(); layer, "setContentsChanged"];
     }
     msg![(); tx, "commit"];
+    // This thread has no run loop to flush implicit transactions later.
+    msg![(); tx, "flush"];
     FRAMES.fetch_add(1, Ordering::SeqCst);
+    if STATS.load(Ordering::Relaxed) {
+        let pts = CMSampleBufferGetPresentationTimeStamp(sample);
+        if pts.flags & kCMTimeFlags_Valid != 0 && pts.timescale > 0 {
+            let captured = pts.value as f64 / pts.timescale as f64;
+            let us = ((CACurrentMediaTime() - captured).max(0.0) * 1e6) as u64;
+            LATENCY_SUM_US.fetch_add(us, Ordering::SeqCst);
+            LATENCY_MAX_US.fetch_max(us, Ordering::SeqCst);
+        }
+    }
 }
 
 // ------------------------------------------------------------ blocks

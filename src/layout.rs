@@ -76,6 +76,14 @@ impl Area {
     }
 }
 
+/// Refresh rate for the virtual display: `--refresh` if given, else the rate
+/// of the screen the viewer is on, so every captured frame lines up with one
+/// of its refreshes (60 fps on an 85 Hz panel stutters), else 60 Hz.
+pub fn refresh_rate(arg: Option<f64>, view_hz: Option<f64>) -> f64 {
+    arg.or(view_hz.filter(|hz| (24.0..=480.0).contains(hz)))
+        .unwrap_or(60.0)
+}
+
 /// `v` rounded down to an even number (some GPUs reject odd display sizes).
 pub fn even_floor(v: f64) -> u32 {
     (v.max(0.0) as u32) & !1
@@ -159,6 +167,15 @@ pub fn exit_point(view: CGRect, virt: CGRect, p: CGPoint, at_edge_only: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_follows_the_viewer_screen() {
+        assert_eq!(refresh_rate(None, Some(85.0)), 85.0);
+        assert_eq!(refresh_rate(Some(60.0), Some(85.0)), 60.0);
+        assert_eq!(refresh_rate(None, None), 60.0);
+        // Some displays report 0 Hz (unknown).
+        assert_eq!(refresh_rate(None, Some(0.0)), 60.0);
+    }
 
     #[test]
     fn even_floor_rounds_down() {
