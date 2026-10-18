@@ -105,6 +105,7 @@ Without `-r`, the virtual display is exactly the size of the area, so the window
 - **Mouse:** when the pointer enters the window, it moves onto the virtual display. Push past the window's side or bottom to come back. The top edge is left alone so the full-screen toolbar can still slide down.
 - **Keyboard:** typing goes to the app, as usual. vdisplay never takes keyboard focus.
 - **Windows:** the viewer is a normal window; other apps can still cover it.
+- **Smoothness:** the virtual display runs at your screen's refresh rate (85 Hz on an 85 Hz monitor), so scrolling doesn't judder, and the pointer is drawn by the viewer rather than captured, so it keeps up with your hand. To check, run with `VDISPLAY_STATS=1`: every 2 seconds it prints the captured frame rate, the capture-to-window delay and the longest pause in vdisplay's loop.
 
 ### Other commands
 
@@ -148,7 +149,7 @@ The native resolution is the display mode macOS marks as native, so a Retina Mac
 | `-m, --mirror` | off | Mirror the virtual display onto a whole physical screen |
 | `--mirror-to <ID>` | main display | Physical display to mirror onto |
 | `--hidpi` | off (on for `--view` without `-r` on a Retina screen) | Retina rendering: pixels = 2 × resolution |
-| `--refresh` | `60` | Refresh rate (Hz) |
+| `--refresh` | `--view` screen's rate, else `60` | Refresh rate (Hz) |
 | `--ppi` | `109` / `218` | Pixel density used for the reported physical size |
 | `--name` | `vdisplay` | Display name in System Settings |
 | `--no-fullscreen` | off | `run` only: maximize instead of native full screen |
