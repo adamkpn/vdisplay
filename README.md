@@ -1,8 +1,18 @@
-# vdisplay
+<p align="center">
+  <img src="docs/icon.png" width="128" height="128" alt="vdisplay icon">
+</p>
+
+<h1 align="center">vdisplay</h1>
+
+<p align="center">
+  <a href="https://github.com/adamkpn/vdisplay/actions/workflows/security.yml"><img src="https://github.com/adamkpn/vdisplay/actions/workflows/security.yml/badge.svg?branch=main" alt="Security scan"></a>
+  <a href="https://github.com/adamkpn/vdisplay/releases/latest"><img src="https://img.shields.io/github/v/release/adamkpn/vdisplay" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/adamkpn/vdisplay" alt="MIT license"></a>
+</p>
 
 **Run any macOS app on a virtual display of any resolution, and show it in part of your screen.**
 
-vdisplay is a small command-line tool for macOS. It creates a virtual monitor (4K, 5K, 8K, ultrawide, or any `WIDTHxHEIGHT`), launches an app on it in native full screen, and shows that monitor live in a window on the left half, a third or a quarter of your real screen. The app believes it is running on a real display of that size, and your other windows stay where they are.
+vdisplay is a small macOS tool, with a command line and a menu bar app. It creates a virtual monitor (4K, 5K, 8K, ultrawide, or any `WIDTHxHEIGHT`), launches an app on it in native full screen, and shows that monitor live in a window on the left half, a third or a quarter of your real screen. The app believes it is running on a real display of that size, and your other windows stay where they are.
 
 ```bash
 brew install adamkpn/tap/vdisplay
@@ -11,7 +21,7 @@ vdisplay run --view left "Microsoft Edge"
 
 That puts Microsoft Edge in native full screen on its own virtual display, shown in the left half of your screen. Move the pointer into it and you are using Edge; move it out and you are back on the rest of your screen.
 
-> **Status:** v0.1, early. Works with Microsoft Edge on macOS 27 (Apple Silicon). Please [open an issue](../../issues) if something misbehaves on your Mac.
+> **Status:** v0.2, early. Works with Microsoft Edge on macOS 27 (Apple Silicon). Please [open an issue](../../issues) if something misbehaves on your Mac.
 
 ## Why
 
@@ -51,7 +61,7 @@ Both link `vdisplay` into Homebrew's `bin`, so they can't be installed side by s
 Get the universal binary from the [latest release](../../releases/latest):
 
 ```bash
-VERSION=0.1.0
+VERSION=0.2.0
 curl -LO https://github.com/adamkpn/vdisplay/releases/download/v$VERSION/vdisplay-$VERSION-macos-universal.tar.gz
 curl -LO https://github.com/adamkpn/vdisplay/releases/download/v$VERSION/vdisplay-$VERSION-macos-universal.tar.gz.sha256
 shasum -a 256 -c vdisplay-$VERSION-macos-universal.tar.gz.sha256
@@ -69,14 +79,8 @@ Needs a Rust toolchain (`brew install rustup && rustup-init`):
 
 ```bash
 git clone https://github.com/adamkpn/vdisplay && cd vdisplay
-make install    # or: cargo install --path .
-```
-
-### Menu bar app
-
-```bash
-make install-app    # builds vdisplay.app and copies it to ~/Applications
-open ~/Applications/vdisplay.app
+make install        # the CLI into ~/.cargo/bin (or: cargo install --path .)
+make install-app    # the menu bar app into ~/Applications
 ```
 
 ## Before the first run
@@ -133,15 +137,21 @@ Without `-r`, the virtual display is exactly the size of the area, so the window
 
 - **Run *app*** starts a session with the current settings; **Run Other App** picks a recent one; **Create Display Only** is `vdisplay create`.
 - **Running** lists the sessions, each with **Stop** and **Open Log**; the icon shows how many are running.
-- **Settings…** has every `run` / `create` option: app (or **Choose…** any .app), app arguments, resolution (presets, `native`, the sizes `suggest` lists for the chosen screen, or custom), Retina, refresh rate, where to show it (a part of the screen, mirrored, or not at all), which screen, full screen, new instance, keep alive, name, ppi and window timeout. Changes are saved right away to `~/Library/Application Support/vdisplay/settings.conf`.
+- **Settings…** has every `run` / `create` option: app (or **Choose…** any `.app`), app arguments, resolution (presets, `native`, the sizes `suggest` lists for the chosen screen, or custom), Retina, refresh rate, where to show it (a part of the screen, mirrored, or not at all), which screen, full screen, new instance, keep alive, name, ppi and window timeout. Changes are saved right away to `~/Library/Application Support/vdisplay/settings.conf`.
 - **Displays** is `vdisplay list`; **Permissions** shows and opens the Accessibility and Screen Recording settings.
 - **Start at Login** installs a LaunchAgent. From a terminal: `vdisplay service install | uninstall | status`. launchd restarts the app if it crashes, but not after **Quit**.
 
-Each session is a `vdisplay run` / `create` process started by the app, with its output in `~/Library/Logs/vdisplay/`. **Stop** and **Quit** end them the way Ctrl-C does: the window leaves full screen and comes back to your screen, and the display is removed. If a session fails (for example Edge was already running), the app shows the error.
+Each session is a `vdisplay run` / `create` process started by the app, with its output in `~/Library/Logs/vdisplay/`. **Stop** and **Quit** end them the way Ctrl-C does: the window leaves full screen and comes back to your screen, and the display is removed. If a session fails (for example Edge was already running), the app shows the error. If you click **Stop sharing** in the macOS menu bar, the window dims and the app offers **Reconnect** or **Stop Session**.
 
 Permissions go to **vdisplay.app**, not your terminal; the app asks for them on first start. Newer macOS calls the Accessibility pane *Device Control and Data Access*; **Permissions** in the menu opens the right pane either way.
 
-**vdisplay is switched on in System Settings but still says it has no access?** macOS ties the grant to the app's code signature. An ad-hoc signed build (`make app` without a certificate, and the current Homebrew releases) is a new identity every time it is rebuilt or upgraded. The old switch then stays on but no longer matches. Click **Reset and Ask Again** in the alert, or **Permissions → Reset Permissions…**, then allow it once more. To avoid this for your own builds, run `make signing-cert` once. It adds a self-signed "vdisplay Local Signing" certificate to your login keychain, and `make app` / `make install-app` then sign with it, so grants survive rebuilds. The trade-off: codesign may use that key without asking, so other software running as you could sign itself as vdisplay and inherit its Accessibility and Screen Recording access. Only do this on a Mac you trust; delete the certificate in Keychain Access to undo it. `make install-app SIGN_IDENTITY="Developer ID Application: …"` uses a real certificate instead. `vdisplay menu` runs the same menu from the bare binary, but then permissions are tied to that binary's path.
+#### Switched on in System Settings, but still no access
+
+macOS ties a permission to the app's code signature. An ad-hoc signed build (`make app` without a certificate, and the current Homebrew releases) is a new identity every time it is rebuilt or upgraded, so the old switch stays on but no longer matches. Click **Reset and Ask Again** in the alert, or **Permissions → Reset Permissions…**, then allow vdisplay once more.
+
+For your own builds, run `make signing-cert` once. It adds a self-signed "vdisplay Local Signing" certificate to your login keychain, and `make app` / `make install-app` then sign with it, so permissions survive rebuilds. The trade-off: codesign may use that key without asking, so other software running as you could sign itself as vdisplay and inherit its access. Only do this on a Mac you trust, and delete the certificate in Keychain Access to undo it. `make install-app SIGN_IDENTITY="Developer ID Application: …"` uses a real certificate instead.
+
+`vdisplay menu` runs the same menu from the bare binary, but then permissions are tied to that binary's path.
 
 ### Other commands
 
@@ -211,7 +221,7 @@ The native resolution is the display mode macOS marks as native, so a Retina Mac
 
 ## Compared with DeskPad and BetterDisplay
 
-[DeskPad](https://github.com/Stengo/DeskPad) and [BetterDisplay](https://github.com/waydabber/BetterDisplay) are apps that create virtual displays you manage by hand. vdisplay is a command-line tool built around one job: start a given app on a display of a given size, put it in full screen there, and show it where you want. That makes it easy to script, alias or bind to a key.
+[DeskPad](https://github.com/Stengo/DeskPad) and [BetterDisplay](https://github.com/waydabber/BetterDisplay) are apps that create virtual displays you manage by hand. vdisplay is built around one job: start a given app on a display of a given size, put it in full screen there, and show it where you want. From the command line that is easy to script, alias or bind to a key; the menu bar app does the same with a click.
 
 ## Requirements
 
@@ -241,7 +251,7 @@ The Trivy, Gitleaks and actionlint targets run in Docker, so there is nothing el
 1. Bump `version` in `Cargo.toml` and commit.
 2. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
 
-[`release.yml`](.github/workflows/release.yml) checks the tag matches `Cargo.toml`, runs `make verify` and `make dist`, publishes the tarball, the app zip and their checksums as a GitHub release, and updates the formula and the cask in [adamkpn/homebrew-tap](https://github.com/adamkpn/homebrew-tap). Running the workflow by hand builds the same files as a downloadable artifact without publishing.
+[`release.yml`](.github/workflows/release.yml) checks the tag matches `Cargo.toml`, runs `make verify`, `make dist` and the security scans, publishes the tarball, the app zip and their checksums as a GitHub release, and updates the formula and the cask in [adamkpn/homebrew-tap](https://github.com/adamkpn/homebrew-tap). Running the workflow by hand builds the same files as a downloadable artifact without publishing.
 
 ### Project layout
 
@@ -264,6 +274,17 @@ src/
 ```
 
 No objc2 or core-foundation crates: the FFI surface is small, and hand-written bindings avoid their API churn.
+
+## Security
+
+The [Security workflow](.github/workflows/security.yml) runs `make security` on every push to `main`, on pull requests, every week, and before each release:
+
+- `cargo audit`: dependency advisories from the RustSec database
+- Trivy: dependency CVEs, hardcoded secrets and misconfigurations
+- Gitleaks: credentials anywhere in the git history
+- a check for home-directory paths and e-mail addresses in tracked files
+
+A release is only published if the scan passes. The badge shows the latest result on `main`: no known issue was found, which is not a promise that none exist. vdisplay makes no network connections.
 
 ## License
 

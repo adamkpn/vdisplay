@@ -1,0 +1,41 @@
+# Security scans behind the README badge: `make security`, which runs
+#   cargo audit  dependency advisories (RustSec)
+#   Trivy        dependency CVEs, hardcoded secrets, misconfigurations
+#   Gitleaks     credentials in the whole git history and the working tree
+#   scan-private home paths and e-mail addresses in tracked files
+# On every push to main and pull request, weekly (new advisories appear
+# without any change here), and from release.yml before anything is published.
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  workflow_call:
+
+permissions: {}
+
+env:
+  CARGO_AUDIT_VERSION: "0.22.2"
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Gitleaks scans every commit, not just the last one.
+          fetch-depth: 0
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
+
+      - name: Scan
+        run: make security
