@@ -88,13 +88,20 @@ notices: ## Third-party license texts of everything in the binary (target/THIRD-
 	@mkdir -p target
 	python3 packaging/third-party-licenses.py $(NOTICES)
 
+# Stripped with Apple's strip, not cargo's: rustup's rust-objcopy (behind
+# `strip = true`) can fail to load libLLVM on CI runners, leaving the release
+# unstripped. Stripping breaks the slices' signatures, so the universal binary
+# is signed again.
 dist: notices ## Universal tarball (binary + vdisplay.app, for the formula) + app zip (cask) + sha256s in target/dist
 	@for t in $(TARGETS); do \
-		PATH="$(DIST_PATH)" cargo build --release --locked --target $$t || exit 1; \
+		PATH="$(DIST_PATH)" CARGO_PROFILE_RELEASE_STRIP=false \
+			cargo build --release --locked --target $$t || exit 1; \
 	done
 	@rm -rf $(DIST) && mkdir -p $(DIST)/vdisplay-$(VERSION)
 	lipo -create $(foreach t,$(TARGETS),target/$(t)/release/vdisplay) \
 		-output $(DIST)/vdisplay-$(VERSION)/vdisplay
+	strip $(DIST)/vdisplay-$(VERSION)/vdisplay
+	codesign --force --sign "$(SIGN_IDENTITY)" $(DIST)/vdisplay-$(VERSION)/vdisplay
 	$(call bundle,$(DIST)/vdisplay-$(VERSION)/vdisplay,$(DIST)/vdisplay-$(VERSION)/vdisplay.app)
 	cp README.md LICENSE $(NOTICES) $(DIST)/vdisplay-$(VERSION)/
 	COPYFILE_DISABLE=1 tar -C $(DIST) -czf $(DIST)/vdisplay-$(VERSION)-macos-universal.tar.gz vdisplay-$(VERSION)
