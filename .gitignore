@@ -26,3 +26,6 @@ rustc-ice-*.txt
 # Local notes, not part of the project
 CLAUDE.md
 docs/conversation-log.md
+
+# macOS Finder metadata
+.DS_Store

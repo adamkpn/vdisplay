@@ -123,45 +123,154 @@ pub fn map_point(from: CGRect, to: CGRect, p: CGPoint) -> CGPoint {
     }
 }
 
-/// Where the pointer goes when it leaves the virtual display `virt` at `p`:
-/// just outside the matching edge of the viewer `view`. Leaving through the
-/// top never exits, so the full-screen toolbar at the top edge stays reachable.
-///
-/// With `at_edge_only`, `p` must be on the left, right or bottom edge (the
-/// pointer is pinned there); otherwise the nearest edge is used (the pointer
-/// already crossed into a neighbouring display from `p`).
-pub fn exit_point(view: CGRect, virt: CGRect, p: CGPoint, at_edge_only: bool) -> Option<CGPoint> {
-    let (vo, vs) = (virt.origin, virt.size);
-    let left = p.x - vo.x;
-    let right = vo.x + vs.width - 1.0 - p.x;
-    let bottom = vo.y + vs.height - 1.0 - p.y;
-    let top = p.y - vo.y;
-    let nearest = left.min(right).min(bottom);
-    if (at_edge_only && nearest >= 1.0) || (!at_edge_only && top < nearest) {
-        return None;
+/// Where the real pointer is, and its last known position.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pointer {
+    /// On a real screen.
+    Outside(CGPoint),
+    /// Moved onto the virtual display because it entered the viewer.
+    Inside(CGPoint),
+}
+
+/// Entering the viewer lands the pointer this far inside the virtual
+/// display's exit edges. Landing right on one (entering from the right puts
+/// it on the right edge) made the next tick push it straight back out.
+pub const ENTRY_INSET: f64 = 2.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Side {
+    Left,
+    Right,
+    Bottom,
+}
+
+/// `p` moved into `r` (onto its last whole point on each side).
+fn clamp_into(r: CGRect, p: CGPoint) -> CGPoint {
+    let (o, s) = (r.origin, r.size);
+    CGPoint {
+        x: p.x.max(o.x).min(o.x + s.width - 1.0),
+        y: p.y.max(o.y).min(o.y + s.height - 1.0),
     }
-    let q = map_point(virt, view, p);
+}
+
+/// Where on the virtual display `virt` a pointer at `p` in the viewer goes.
+pub fn entry_point(view: CGRect, virt: CGRect, p: CGPoint) -> CGPoint {
+    let v = map_point(view, virt, p);
+    let (o, s) = (virt.origin, virt.size);
+    CGPoint {
+        x: v.x
+            .max(o.x + ENTRY_INSET)
+            .min(o.x + s.width - 1.0 - ENTRY_INSET),
+        y: v.y.min(o.y + s.height - 1.0 - ENTRY_INSET),
+    }
+}
+
+/// The exit edge `p` (on `virt`) is pushed against. The top is not one, so
+/// the full-screen toolbar there stays reachable.
+fn pinned_side(virt: CGRect, p: CGPoint) -> Option<Side> {
+    let (o, s) = (virt.origin, virt.size);
+    if p.x - o.x < 1.0 {
+        Some(Side::Left)
+    } else if o.x + s.width - 1.0 - p.x < 1.0 {
+        Some(Side::Right)
+    } else if o.y + s.height - 1.0 - p.y < 1.0 {
+        Some(Side::Bottom)
+    } else {
+        None
+    }
+}
+
+/// The side of `virt` that `p` (just off it, on a neighbouring display)
+/// crossed; None for the top.
+fn crossed_side(virt: CGRect, p: CGPoint) -> Option<Side> {
+    let (o, s) = (virt.origin, virt.size);
+    if p.x < o.x {
+        Some(Side::Left)
+    } else if p.x >= o.x + s.width {
+        Some(Side::Right)
+    } else if p.y >= o.y + s.height {
+        Some(Side::Bottom)
+    } else {
+        None
+    }
+}
+
+/// Just outside the viewer's matching edge, for a pointer leaving `virt` at
+/// `at` by `side`; None if no real screen is there.
+fn leave(
+    view: CGRect,
+    virt: CGRect,
+    at: CGPoint,
+    side: Side,
+    screens: &[CGRect],
+) -> Option<CGPoint> {
+    let q = map_point(virt, view, at);
     let (x0, x1, y1) = (
         view.origin.x,
         view.origin.x + view.size.width,
         view.origin.y + view.size.height,
     );
-    Some(if nearest == left {
-        CGPoint {
+    let t = match side {
+        Side::Left => CGPoint {
             x: x0 - 2.0,
             y: q.y,
-        }
-    } else if nearest == right {
-        CGPoint {
+        },
+        Side::Right => CGPoint {
             x: x1 + 1.0,
             y: q.y,
-        }
-    } else {
-        CGPoint {
+        },
+        Side::Bottom => CGPoint {
             x: q.x,
             y: y1 + 1.0,
+        },
+    };
+    (screens.iter().any(|s| s.contains(t)) && !view.contains(t)).then_some(t)
+}
+
+/// One step of the pointer handoff: with the pointer now at `p`, the new
+/// state and where to move the pointer, if anywhere. `screens` are the real
+/// displays; `capturing` is false while the viewer shows no picture.
+pub fn step(
+    state: Pointer,
+    p: CGPoint,
+    view: CGRect,
+    virt: CGRect,
+    screens: &[CGRect],
+    capturing: bool,
+) -> (Pointer, Option<CGPoint>) {
+    match state {
+        // Reached the virtual display across a shared edge, not through the
+        // viewer: hold it at that edge (going back to the last position
+        // made it bounce).
+        Pointer::Outside(last) if virt.contains(p) => {
+            let back = screens
+                .iter()
+                .find(|s| s.contains(last))
+                .map_or(last, |s| clamp_into(*s, p));
+            (Pointer::Outside(back), Some(back))
         }
-    })
+        Pointer::Outside(_) if capturing && view.contains(p) => {
+            let v = entry_point(view, virt, p);
+            (Pointer::Inside(v), Some(v))
+        }
+        Pointer::Outside(_) => (Pointer::Outside(p), None),
+        // Pushed against an edge with a real screen beyond the viewer: leave.
+        Pointer::Inside(_) if virt.contains(p) => {
+            match pinned_side(virt, p).and_then(|side| leave(view, virt, p, side, screens)) {
+                Some(out) => (Pointer::Outside(out), Some(out)),
+                None => (Pointer::Inside(p), None),
+            }
+        }
+        // Crossed into a neighbouring display: leave by the side it crossed,
+        // or hold it at that edge if there is nowhere to go.
+        Pointer::Inside(_) => {
+            let edge = clamp_into(virt, p);
+            match crossed_side(virt, p).and_then(|side| leave(view, virt, edge, side, screens)) {
+                Some(out) => (Pointer::Outside(out), Some(out)),
+                None => (Pointer::Inside(edge), Some(edge)),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -248,42 +357,141 @@ mod tests {
         );
     }
 
+    /// The 3440x1440 main display the viewer and `VIRT` sit on / next to.
+    const MAIN: CGRect = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize {
+            width: 3440.0,
+            height: 1440.0,
+        },
+    };
+
+    fn step_main(state: Pointer, p: CGPoint) -> (Pointer, Option<CGPoint>) {
+        step(state, p, VIEW, VIRT, &[MAIN], true)
+    }
+
     #[test]
-    fn exits_right_of_the_view_at_the_right_edge() {
+    fn entering_from_the_right_is_not_pushed_straight_back_out() {
+        let at_edge = CGPoint {
+            x: 1719.0,
+            y: 732.0,
+        };
+        let (state, warp) = step_main(
+            Pointer::Outside(CGPoint {
+                x: 1725.0,
+                y: 732.0,
+            }),
+            at_edge,
+        );
+        let Pointer::Inside(v) = state else {
+            panic!("should enter: {state:?}")
+        };
+        assert_eq!(warp, Some(v));
+        assert_eq!(v.x, 3440.0 + 1719.0 - ENTRY_INSET);
+        // The pointer hasn't moved yet: it stays in.
+        assert_eq!(step_main(state, v), (Pointer::Inside(v), None));
+    }
+
+    #[test]
+    fn leaves_right_of_the_view_when_pushed_against_the_right_edge() {
         let p = CGPoint {
             x: 3440.0 + 1719.0,
             y: 700.0,
         };
-        let out = exit_point(VIEW, VIRT, p, true).expect("should exit");
-        assert_near(
-            out,
-            CGPoint {
-                x: 1721.0,
-                y: 732.0,
-            },
+        let out = CGPoint {
+            x: 1721.0,
+            y: 732.0,
+        };
+        assert_eq!(
+            step_main(Pointer::Inside(p), p),
+            (Pointer::Outside(out), Some(out))
         );
     }
 
     #[test]
     fn stays_inside_away_from_edges_and_at_the_top() {
-        let middle = CGPoint {
-            x: 4000.0,
-            y: 700.0,
-        };
-        assert_eq!(exit_point(VIEW, VIRT, middle, true), None);
-        let top = CGPoint { x: 4000.0, y: 0.0 };
-        assert_eq!(exit_point(VIEW, VIRT, top, true), None);
-        assert_eq!(exit_point(VIEW, VIRT, top, false), None);
+        for p in [
+            CGPoint {
+                x: 4000.0,
+                y: 700.0,
+            },
+            CGPoint { x: 4000.0, y: 0.0 },
+        ] {
+            assert_eq!(step_main(Pointer::Inside(p), p), (Pointer::Inside(p), None));
+        }
+        // Crossing the top (into a display above) is held at the edge.
+        let above = CGPoint { x: 4000.0, y: -3.0 };
+        let edge = CGPoint { x: 4000.0, y: 0.0 };
+        assert_eq!(
+            step_main(Pointer::Inside(edge), above),
+            (Pointer::Inside(edge), Some(edge))
+        );
     }
 
     #[test]
-    fn crossing_the_left_edge_targets_left_of_the_view() {
-        let p = CGPoint {
-            x: 3441.0,
+    fn crossing_onto_the_virtual_display_is_held_at_the_edge() {
+        // From the right edge of the main display into VIRT next to it.
+        let last = CGPoint {
+            x: 3400.0,
             y: 700.0,
         };
-        let out = exit_point(VIEW, VIRT, p, false).expect("should exit");
-        assert_near(out, CGPoint { x: -2.0, y: 732.0 });
+        let p = CGPoint {
+            x: 3460.0,
+            y: 700.0,
+        };
+        let edge = CGPoint {
+            x: 3439.0,
+            y: 700.0,
+        };
+        assert_eq!(
+            step_main(Pointer::Outside(last), p),
+            (Pointer::Outside(edge), Some(edge))
+        );
+    }
+
+    #[test]
+    fn crossing_into_a_neighbour_leaves_by_that_side() {
+        // VIRT's left edge touches the main display. With the view in the
+        // right half there is room left of it.
+        let view = rect(1720.0, 32.0, 1720.0, 1408.0);
+        let inside = CGPoint {
+            x: 3445.0,
+            y: 700.0,
+        };
+        let crossed = CGPoint {
+            x: 3430.0,
+            y: 700.0,
+        };
+        let out = CGPoint {
+            x: 1718.0,
+            y: 732.0,
+        };
+        assert_eq!(
+            step(Pointer::Inside(inside), crossed, view, VIRT, &[MAIN], true),
+            (Pointer::Outside(out), Some(out))
+        );
+        // With the view at the screen's left edge there is not: held at the edge.
+        let edge = CGPoint {
+            x: 3440.0,
+            y: 700.0,
+        };
+        assert_eq!(
+            step_main(Pointer::Inside(inside), crossed),
+            (Pointer::Inside(edge), Some(edge))
+        );
+    }
+
+    #[test]
+    fn no_handoff_without_a_picture() {
+        let p = CGPoint { x: 100.0, y: 300.0 };
+        let state = Pointer::Outside(CGPoint {
+            x: 1800.0,
+            y: 300.0,
+        });
+        assert_eq!(
+            step(state, p, VIEW, VIRT, &[MAIN], false),
+            (Pointer::Outside(p), None)
+        );
     }
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {

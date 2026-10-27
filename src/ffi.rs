@@ -125,6 +125,12 @@ extern "C" {
 
 // --------------------------------------------------------------- CoreGraphics
 pub const kCGConfigureForAppOnly: u32 = 0;
+pub const kCGEventSourceStateHIDSystemState: i32 = 1;
+pub const kCGHIDEventTap: u32 = 0;
+pub const kCGEventMouseMoved: u32 = 5;
+pub const kCGEventLeftMouseDragged: u32 = 6;
+pub const kCGEventRightMouseDragged: u32 = 7;
+pub const kCGEventOtherMouseDragged: u32 = 27;
 /// IOGraphicsTypes.h: the panel's native resolution.
 pub const kDisplayModeNativeFlag: u32 = 0x0200_0000;
 
@@ -145,6 +151,7 @@ extern "C" {
     ) -> CGError;
     pub fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
     pub fn CGDisplayIsBuiltin(display: CGDirectDisplayID) -> u32;
+    pub fn CGDisplayVendorNumber(display: CGDirectDisplayID) -> u32;
     pub fn CGDisplayMirrorsDisplay(display: CGDirectDisplayID) -> CGDirectDisplayID;
     pub fn CGDisplayCopyDisplayMode(display: CGDirectDisplayID) -> CGDisplayModeRef;
     pub fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
@@ -162,6 +169,16 @@ extern "C" {
     pub fn CGEventCreate(source: *const c_void) -> CFTypeRef;
     pub fn CGEventGetLocation(event: CFTypeRef) -> CGPoint;
     pub fn CGWarpMouseCursorPosition(point: CGPoint) -> CGError;
+    pub fn CGEventSourceCreate(state: i32) -> CFTypeRef;
+    pub fn CGEventSourceSetLocalEventsSuppressionInterval(source: CFTypeRef, seconds: f64);
+    pub fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
+    pub fn CGEventCreateMouseEvent(
+        source: CFTypeRef,
+        kind: u32,
+        point: CGPoint,
+        button: u32,
+    ) -> CFTypeRef;
+    pub fn CGEventPost(tap: u32, event: CFTypeRef);
     pub fn CGAssociateMouseAndMouseCursorPosition(connected: u32) -> CGError;
     pub fn CGPreflightScreenCaptureAccess() -> bool;
     pub fn CGRequestScreenCaptureAccess() -> bool;
@@ -238,6 +255,8 @@ pub const RTLD_NOW: i32 = 2;
 /// `RTLD_DEFAULT` on macOS: search every loaded image.
 pub const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
 pub const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+pub const LOCK_EX: i32 = 2;
+pub const LOCK_NB: i32 = 4;
 
 extern "C" {
     /// `dispatch_get_main_queue()` is a macro for `&_dispatch_main_q`.
@@ -254,6 +273,11 @@ extern "C" {
     /// isa of a global (static, never copied) Objective-C block.
     pub static _NSConcreteGlobalBlock: Opaque;
     pub fn kill(pid: i32, sig: i32) -> i32;
+    pub fn getuid() -> u32;
+    pub fn getppid() -> i32;
+    /// Returns the previous handler (`sig_t`), unused.
+    pub fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+    pub fn flock(fd: i32, operation: i32) -> i32;
     pub fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
     pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }

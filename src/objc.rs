@@ -64,6 +64,15 @@ pub unsafe fn nsstring_to_string(s: Id) -> Option<String> {
     (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
 }
 
+/// Autoreleased `NSString*` (call inside an autorelease pool).
+pub unsafe fn ns_string(s: &str) -> Id {
+    let c = CString::new(s.replace('\0', "")).unwrap_or_default();
+    let Some(cls) = class("NSString") else {
+        return ptr::null_mut();
+    };
+    msg![Id; cls, "stringWithUTF8String:", c.as_ptr() => *const c_char]
+}
+
 /// Owned `CFStringRef`, toll-free bridged to `NSString*`.
 pub struct CfStr(pub CFStringRef);
 

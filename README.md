@@ -27,15 +27,24 @@ That puts Microsoft Edge in native full screen on its own virtual display, shown
 - **`--mirror`:** makes a whole physical screen mirror the virtual display, scaled to fit. macOS reverts it automatically when vdisplay exits, even after a crash.
 - **Window placement:** moves the app's window onto the virtual display and enters native full screen; on exit it takes the window out of full screen and hands it back.
 - **`suggest`:** reads your screen's real native resolution and suggests sizes that fit it.
+- **Menu bar app:** the same options in a menu and a small Settings window, running in the background and starting at login.
 - **One small binary:** universal (Apple Silicon and Intel), no runtime dependencies.
 
 ## Install
 
 ### Homebrew
 
+Both install the `vdisplay` command and the menu bar app (one binary). Pick one:
+
 ```bash
-brew install adamkpn/tap/vdisplay
+brew install --cask adamkpn/tap/vdisplay   # cask: vdisplay.app in /Applications
+brew install adamkpn/tap/vdisplay          # formula: app inside Homebrew's prefix
 ```
+
+- **Cask:** the app shows up in `/Applications`, Launchpad and Spotlight. vdisplay is not notarized, so if macOS blocks it the first time you open it after an install or upgrade, click **Open Anyway** in *System Settings → Privacy & Security*. `brew uninstall --cask vdisplay` quits the app first, which stops its sessions cleanly; add `--zap` to also remove the settings, logs and the Start at Login agent.
+- **Formula:** no Gatekeeper prompt. The app is `$(brew --prefix)/opt/vdisplay/vdisplay.app`: open it from there, or run `vdisplay service install` to start it now and at every login. Quit and reopen it after `brew upgrade`.
+
+Both link `vdisplay` into Homebrew's `bin`, so they can't be installed side by side. To switch, uninstall one first.
 
 ### Download
 
@@ -52,6 +61,8 @@ sudo mv vdisplay-$VERSION/vdisplay /usr/local/bin/
 
 The binary is not notarized. If you downloaded it with a browser, run `xattr -d com.apple.quarantine vdisplay` first.
 
+The same release has the menu bar app as `vdisplay-$VERSION-macos-app.zip`. Unzip it and move `vdisplay.app` to `/Applications`.
+
 ### From source
 
 Needs a Rust toolchain (`brew install rustup && rustup-init`):
@@ -61,9 +72,18 @@ git clone https://github.com/adamkpn/vdisplay && cd vdisplay
 make install    # or: cargo install --path .
 ```
 
+### Menu bar app
+
+```bash
+make install-app    # builds vdisplay.app and copies it to ~/Applications
+open ~/Applications/vdisplay.app
+```
+
 ## Before the first run
 
-1. **Accessibility:** vdisplay moves other apps' windows. Allow your terminal app (Terminal, iTerm2, Ghostty, …) in *System Settings → Privacy & Security → Accessibility*.
+These are for the command line. The menu bar app asks for the permissions itself, for vdisplay.app.
+
+1. **Accessibility:** vdisplay moves other apps' windows. Allow your terminal app (Terminal, iTerm2, Ghostty, …) in *System Settings → Privacy & Security → Accessibility* (*Device Control and Data Access* on newer macOS).
 2. **Screen Recording** (only for `--view`): allow the same terminal in *System Settings → Privacy & Security → Screen & System Audio Recording*.
 3. Restart the terminal after granting either one.
 4. Turn on *System Settings → Desktop & Dock → Displays have separate Spaces*, so native full screen stays on the virtual display.
@@ -106,6 +126,22 @@ Without `-r`, the virtual display is exactly the size of the area, so the window
 - **Keyboard:** typing goes to the app, as usual. vdisplay never takes keyboard focus.
 - **Windows:** the viewer is a normal window; other apps can still cover it.
 - **Smoothness:** the virtual display runs at your screen's refresh rate (85 Hz on an 85 Hz monitor), so scrolling doesn't judder, and the pointer is drawn by the viewer rather than captured, so it keeps up with your hand. To check, run with `VDISPLAY_STATS=1`: every 2 seconds it prints the captured frame rate, the capture-to-window delay and the longest pause in vdisplay's loop.
+
+### Menu bar app
+
+`vdisplay.app` puts a display icon in the menu bar (no Dock icon):
+
+- **Run *app*** starts a session with the current settings; **Run Other App** picks a recent one; **Create Display Only** is `vdisplay create`.
+- **Running** lists the sessions, each with **Stop** and **Open Log**; the icon shows how many are running.
+- **Settings…** has every `run` / `create` option: app (or **Choose…** any .app), app arguments, resolution (presets, `native`, the sizes `suggest` lists for the chosen screen, or custom), Retina, refresh rate, where to show it (a part of the screen, mirrored, or not at all), which screen, full screen, new instance, keep alive, name, ppi and window timeout. Changes are saved right away to `~/Library/Application Support/vdisplay/settings.conf`.
+- **Displays** is `vdisplay list`; **Permissions** shows and opens the Accessibility and Screen Recording settings.
+- **Start at Login** installs a LaunchAgent. From a terminal: `vdisplay service install | uninstall | status`. launchd restarts the app if it crashes, but not after **Quit**.
+
+Each session is a `vdisplay run` / `create` process started by the app, with its output in `~/Library/Logs/vdisplay/`. **Stop** and **Quit** end them the way Ctrl-C does: the window leaves full screen and comes back to your screen, and the display is removed. If a session fails (for example Edge was already running), the app shows the error.
+
+Permissions go to **vdisplay.app**, not your terminal; the app asks for them on first start. Newer macOS calls the Accessibility pane *Device Control and Data Access*; **Permissions** in the menu opens the right pane either way.
+
+**vdisplay is switched on in System Settings but still says it has no access?** macOS ties the grant to the app's code signature. An ad-hoc signed build (`make app` without a certificate, and the current Homebrew releases) is a new identity every time it is rebuilt or upgraded. The old switch then stays on but no longer matches. Click **Reset and Ask Again** in the alert, or **Permissions → Reset Permissions…**, then allow it once more. To avoid this for your own builds, run `make signing-cert` once. It adds a self-signed "vdisplay Local Signing" certificate to your login keychain, and `make app` / `make install-app` then sign with it, so grants survive rebuilds. The trade-off: codesign may use that key without asking, so other software running as you could sign itself as vdisplay and inherit its Accessibility and Screen Recording access. Only do this on a Mac you trust; delete the certificate in Keychain Access to undo it. `make install-app SIGN_IDENTITY="Developer ID Application: …"` uses a real certificate instead. `vdisplay menu` runs the same menu from the bare binary, but then permissions are tied to that binary's path.
 
 ### Other commands
 
@@ -171,7 +207,7 @@ The native resolution is the display mode macOS marks as native, so a Retina Mac
 - **Already-running apps:** vdisplay moves the app's front window and ignores launch arguments. Chromium browsers hand a new launch to the running instance; quit them first, or use `--new-instance` with a separate `--user-data-dir`.
 - **Resolution limits:** very large sizes (e.g. 8K with `--hidpi`, 15360×8640 px) can exceed what your GPU accepts. `applySettings failed` means try a smaller size or drop `--hidpi`.
 - **`create` and full screen:** `create` doesn't know which windows you moved onto the display. Take them out of full screen before pressing Ctrl-C, or macOS moves their full-screen Space to your main screen.
-- **Private API:** `CGVirtualDisplay` is undocumented and may change in a future macOS release. Everything else is public API.
+- **Private API:** `CGVirtualDisplay` (the virtual display) and `CGSCurrentCursorSeed` (to notice when the pointer's shape changes; optional) are undocumented and may change in a future macOS release. Everything else is public API.
 
 ## Compared with DeskPad and BetterDisplay
 
@@ -190,7 +226,11 @@ The native resolution is the display mode macOS marks as native, so a Retina Mac
 make tools      # once: cargo-audit + the x86_64/arm64 rustup targets
 make verify     # rustfmt check, clippy -D warnings, tests, release build (same as CI)
 make security   # cargo audit, Trivy, Gitleaks, and a check for home paths / e-mails
-make dist       # universal binary + tarball + sha256 in target/dist
+make dist       # universal tarball (binary + app, formula) + app zip (cask) + sha256s in target/dist
+make app        # target/release/vdisplay.app (install-app: copy to ~/Applications)
+make icon       # redraw packaging/AppIcon.icns from packaging/make-icon.swift
+make signing-cert  # once: self-signed certificate so permissions survive rebuilds
+make notices    # THIRD-PARTY-LICENSES.txt for everything compiled into the binary
 make run ARGS="suggest"
 ```
 
@@ -201,13 +241,18 @@ The Trivy, Gitleaks and actionlint targets run in Docker, so there is nothing el
 1. Bump `version` in `Cargo.toml` and commit.
 2. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
 
-[`release.yml`](.github/workflows/release.yml) checks the tag matches `Cargo.toml`, runs `make verify` and `make dist`, publishes the tarball and checksum as a GitHub release, and updates the formula in [adamkpn/homebrew-tap](https://github.com/adamkpn/homebrew-tap). Running the workflow by hand builds the same files as a downloadable artifact without publishing.
+[`release.yml`](.github/workflows/release.yml) checks the tag matches `Cargo.toml`, runs `make verify` and `make dist`, publishes the tarball, the app zip and their checksums as a GitHub release, and updates the formula and the cask in [adamkpn/homebrew-tap](https://github.com/adamkpn/homebrew-tap). Running the workflow by hand builds the same files as a downloadable artifact without publishing.
 
 ### Project layout
 
 ```
 src/
 ├── main.rs      CLI (clap), orchestration, Ctrl-C handling
+├── menubar.rs   Menu bar app: status item, menu, actions
+├── prefs.rs     Menu bar app: Settings window
+├── settings.rs  Menu bar settings file and the run/create arguments they make
+├── sessions.rs  Sessions as child processes: spawn, stop, logs, errors
+├── service.rs   LaunchAgent install / uninstall / status
 ├── vdisplay.rs  CGVirtualDisplay creation, display listing, native resolution, mirroring
 ├── viewer.rs    --view window: ScreenCaptureKit capture, pointer handoff
 ├── layout.rs    --view geometry: screen areas, fitting, pointer mapping
@@ -222,4 +267,4 @@ No objc2 or core-foundation crates: the FFI surface is small, and hand-written b
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Release downloads and vdisplay.app include `THIRD-PARTY-LICENSES.txt` with the licenses of the Rust standard library and the crates compiled in (all MIT or Apache-2.0); `make notices` generates it.

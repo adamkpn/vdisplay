@@ -6,7 +6,7 @@
 //! typing reach the app there directly; at the window's edge it is moved back.
 
 use crate::ffi::*;
-use crate::layout;
+use crate::layout::{self, Pointer};
 use crate::msg;
 use crate::objc::*;
 use anyhow::{bail, Context, Result};
@@ -30,6 +30,21 @@ static STATS: AtomicBool = AtomicBool::new(false);
 static LATENCY_SUM_US: AtomicU64 = AtomicU64::new(0);
 static LATENCY_MAX_US: AtomicU64 = AtomicU64::new(0);
 const STATS_EVERY: Duration = Duration::from_secs(2);
+
+/// Set by `stream:didStopWithError:`, e.g. after "Stop sharing" in the menu bar.
+static CAPTURE_STOPPED: AtomicBool = AtomicBool::new(false);
+/// Set by SIGUSR1 (the menu bar app's Reconnect): start capturing again.
+static RECONNECT: AtomicBool = AtomicBool::new(false);
+const SIGUSR1: i32 = 30;
+
+extern "C" fn on_sigusr1(_: i32) {
+    RECONNECT.store(true, Ordering::SeqCst);
+}
+
+/// Lines on stdout the menu bar app reads from the session log
+/// (`sessions::capture_status`).
+pub const STATUS_STOPPED: &str = "status: capture-stopped";
+pub const STATUS_RUNNING: &str = "status: capture-running";
 
 /// Main-loop side of the stats (only touched on the main thread).
 struct Stats {
@@ -99,14 +114,10 @@ impl Stats {
     }
 }
 
-/// Where the real pointer is, and its last known position.
-#[derive(Clone, Copy, Debug)]
-enum Pointer {
-    /// On a real screen.
-    Outside(CGPoint),
-    /// Moved onto the virtual display because it entered the viewer.
-    Inside(CGPoint),
-}
+/// How often the list of real screens (for leaving the viewer) is re-read.
+const SCREENS_EVERY: Duration = Duration::from_secs(1);
+/// Whether `move_pointer` may post events (needs Accessibility).
+static POST_EVENTS: AtomicBool = AtomicBool::new(false);
 
 /// NSActivityUserInitiated | NSActivityLatencyCritical: no App Nap and no timer
 /// coalescing for a background process, so frames and the pointer stay on time.
@@ -159,6 +170,17 @@ pub struct Viewer {
     display: CGDirectDisplayID,
     pointer: Pointer,
     stats: Option<Stats>,
+    /// Capture size and rate, to start the stream again.
+    pixels: (u32, u32),
+    fps: f64,
+    /// False after the capture stopped: no frames and no pointer handoff.
+    capturing: bool,
+    /// Dims the window and says why while not capturing (+1 retained).
+    overlay: Id,
+    /// Real screens (not virtual displays vdisplay made), re-read every
+    /// `SCREENS_EVERY`.
+    screens: Vec<CGRect>,
+    screens_read: Option<Instant>,
 }
 
 impl Viewer {
@@ -175,8 +197,9 @@ impl Viewer {
                 CGRequestScreenCaptureAccess();
                 bail!(
                     "Screen Recording permission is required to show the virtual display in a window.\n\
-                     Grant it to your terminal in System Settings > Privacy & Security > \
-                     Screen & System Audio Recording, then restart the terminal and run again."
+                     Grant it to your terminal (or to vdisplay.app for the menu bar app) in \
+                     System Settings > Privacy & Security > Screen & System Audio Recording, \
+                     then restart it and run again."
                 );
             }
             let path = CString::new(
@@ -208,7 +231,7 @@ impl Viewer {
             let attr =
                 dispatch_queue_attr_make_with_qos_class(ptr::null(), QOS_CLASS_USER_INTERACTIVE, 0);
             let frame_queue = dispatch_queue_create(label.as_ptr(), attr);
-            let (window, frames_layer, pointer_layer) = create_window(rect)?;
+            let (window, frames_layer, pointer_layer, overlay) = create_window(rect)?;
             let mut viewer = Viewer {
                 window,
                 stream: ptr::null_mut(),
@@ -229,11 +252,18 @@ impl Viewer {
                 display,
                 pointer: Pointer::Outside(mouse_location()),
                 stats: None,
+                pixels,
+                fps,
+                capturing: false,
+                overlay,
+                screens: Vec::new(),
+                screens_read: None,
             };
-            let sc_display = find_sc_display(display)?;
-            let started = start_stream(sc_display, pixels, fps, frame_queue);
-            release(sc_display);
-            (viewer.stream, viewer.output) = started?;
+            POST_EVENTS.store(crate::window::is_trusted(false), Ordering::SeqCst);
+            (viewer.stream, viewer.output) = capture(display, pixels, fps, frame_queue)?;
+            viewer.capturing = true;
+            CAPTURE_STOPPED.store(false, Ordering::SeqCst);
+            signal(SIGUSR1, on_sigusr1);
 
             let deadline = Instant::now() + Duration::from_secs(5);
             while FRAMES.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
@@ -242,7 +272,7 @@ impl Viewer {
             if FRAMES.load(Ordering::SeqCst) == 0 {
                 eprintln!(
                     "warning: no frames from the virtual display yet. If the window stays black, \
-                     check Screen Recording permission for your terminal."
+                     check Screen Recording permission for your terminal or vdisplay.app."
                 );
             }
             if std::env::var("VDISPLAY_STATS").is_ok_and(|v| !v.is_empty() && v != "0") {
@@ -261,46 +291,101 @@ impl Viewer {
             stats.tick();
         }
         let work = Instant::now();
+        if CAPTURE_STOPPED.swap(false, Ordering::SeqCst) && self.capturing {
+            self.capture_stopped();
+        }
+        if RECONNECT.swap(false, Ordering::SeqCst) && !self.capturing {
+            self.reconnect();
+        }
         let p = mouse_location();
         let virt = unsafe { CGDisplayBounds(self.display) };
-        self.pointer = match self.pointer {
-            // Reached the virtual display across a shared edge, not through
-            // the viewer: put it back.
-            Pointer::Outside(last) if virt.contains(p) => {
-                warp(last);
-                Pointer::Outside(last)
+        if self
+            .screens_read
+            .is_none_or(|t| t.elapsed() >= SCREENS_EVERY)
+        {
+            self.screens = real_screens();
+            self.screens_read = Some(Instant::now());
+        }
+        let before = self.pointer;
+        let target;
+        (self.pointer, target) = layout::step(
+            self.pointer,
+            p,
+            self.rect,
+            virt,
+            &self.screens,
+            self.capturing,
+        );
+        if let Some(t) = target {
+            move_pointer(t);
+            if self.stats.is_some()
+                && std::mem::discriminant(&before) != std::mem::discriminant(&self.pointer)
+            {
+                eprintln!("pointer: {before:?} -> {:?} (was at {p:?})", self.pointer);
             }
-            Pointer::Outside(_) if self.rect.contains(p) => {
-                let v = layout::map_point(self.rect, virt, p);
-                warp(v);
-                Pointer::Inside(v)
-            }
-            Pointer::Outside(_) => Pointer::Outside(p),
-            // Pinned at an edge with a real screen beyond the viewer: leave.
-            Pointer::Inside(_) if virt.contains(p) => {
-                match self.exit(layout::exit_point(self.rect, virt, p, true)) {
-                    Some(out) => Pointer::Outside(out),
-                    None => Pointer::Inside(p),
-                }
-            }
-            // Crossed into another display: continue from the viewer's edge,
-            // or go back if there is nowhere to go on that side.
-            Pointer::Inside(last) => {
-                match self.exit(layout::exit_point(self.rect, virt, last, false)) {
-                    Some(out) => Pointer::Outside(out),
-                    None => {
-                        warp(last);
-                        Pointer::Inside(last)
-                    }
-                }
-            }
-        };
+        }
         match self.pointer {
             Pointer::Inside(v) => self.draw_pointer(layout::map_point(virt, self.rect, v)),
             Pointer::Outside(_) => self.hide_pointer(),
         }
         if let Some(stats) = self.stats.as_mut() {
             stats.max_work = stats.max_work.max(work.elapsed());
+        }
+    }
+
+    /// The capture ended (the user clicked "Stop sharing", or macOS stopped
+    /// it): hand the pointer back, dim the window and tell the user.
+    fn capture_stopped(&mut self) {
+        self.capturing = false;
+        if let Pointer::Inside(v) = self.pointer {
+            let out = layout::map_point(unsafe { CGDisplayBounds(self.display) }, self.rect, v);
+            move_pointer(out);
+            self.pointer = Pointer::Outside(out);
+        }
+        self.hide_pointer();
+        unsafe {
+            detach_output(self.stream, self.output);
+            release(self.stream);
+            release(self.output);
+        }
+        self.stream = ptr::null_mut();
+        self.output = ptr::null_mut();
+        self.show_overlay(true);
+        println!("{STATUS_STOPPED}");
+        eprintln!(
+            "Screen capture stopped, so the window no longer shows the virtual display. \
+             Reconnect from the vdisplay menu bar app (or `kill -USR1 {}`), or press Ctrl-C to stop.",
+            std::process::id()
+        );
+    }
+
+    /// Starts capturing again after `capture_stopped`.
+    fn reconnect(&mut self) {
+        match unsafe { capture(self.display, self.pixels, self.fps, self.frame_queue) } {
+            Ok((stream, output)) => {
+                (self.stream, self.output) = (stream, output);
+                self.capturing = true;
+                self.show_overlay(false);
+                println!("{STATUS_RUNNING}");
+                eprintln!("Screen capture reconnected");
+            }
+            Err(e) => {
+                // Still stopped: tell the menu bar app again.
+                println!("{STATUS_STOPPED}");
+                eprintln!("warning: could not reconnect the screen capture: {e:#}");
+            }
+        }
+    }
+
+    fn show_overlay(&self, on: bool) {
+        let Some(tx) = class("CATransaction") else {
+            return;
+        };
+        unsafe {
+            msg![(); tx, "begin"];
+            msg![(); tx, "setDisableActions:", 1i8 => i8];
+            msg![(); self.overlay, "setHidden:", (!on) as i8 => i8];
+            msg![(); tx, "commit"];
         }
     }
 
@@ -391,18 +476,6 @@ impl Viewer {
         pl.shape_seed = None;
         pl.shape_read = None;
     }
-
-    /// Warps to `target` if it is on a real screen outside the viewer.
-    fn exit(&self, target: Option<CGPoint>) -> Option<CGPoint> {
-        let t = target?;
-        let on_screen = crate::vdisplay::active_displays()
-            .into_iter()
-            .any(|id| id != self.display && unsafe { CGDisplayBounds(id) }.contains(t));
-        (on_screen && !self.rect.contains(t)).then(|| {
-            warp(t);
-            t
-        })
-    }
 }
 
 impl Drop for Viewer {
@@ -410,7 +483,7 @@ impl Drop for Viewer {
         unsafe {
             // Hand the pointer back where the user sees it.
             if let Pointer::Inside(p) = self.pointer {
-                warp(layout::map_point(
+                move_pointer(layout::map_point(
                     CGDisplayBounds(self.display),
                     self.rect,
                     p,
@@ -426,10 +499,12 @@ impl Drop for Viewer {
             if !self.frame_queue.is_null() {
                 dispatch_sync_f(self.frame_queue, ptr::null_mut(), drained);
             }
+            detach_output(self.stream, self.output);
             release(self.stream);
             release(self.output);
             release(self.frames_layer);
             release(self.pointer_layer.layer);
+            release(self.overlay);
             if !self.frame_queue.is_null() {
                 dispatch_release(self.frame_queue);
             }
@@ -460,10 +535,51 @@ fn mouse_location() -> CGPoint {
     }
 }
 
-fn warp(p: CGPoint) {
+/// Bounds of the active displays that are real screens.
+fn real_screens() -> Vec<CGRect> {
+    crate::vdisplay::active_displays()
+        .into_iter()
+        .filter(|&id| unsafe { CGDisplayVendorNumber(id) } != crate::vdisplay::VENDOR_ID)
+        .map(|id| unsafe { CGDisplayBounds(id) })
+        .collect()
+}
+
+/// Moves the pointer to `p` by posting a mouse event, as a mouse would.
+/// `CGWarpMouseCursorPosition` makes macOS ignore real movement for a moment
+/// after every jump, which felt like the pointer sticking at the viewer's
+/// edges. Posting needs Accessibility; without it, this falls back to a warp.
+fn move_pointer(p: CGPoint) {
+    // The event source, created once, with no suppression after its events.
+    static SOURCE: OnceLock<usize> = OnceLock::new();
     unsafe {
+        if POST_EVENTS.load(Ordering::SeqCst) {
+            let source = *SOURCE.get_or_init(|| {
+                let s = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+                if !s.is_null() {
+                    CGEventSourceSetLocalEventsSuppressionInterval(s, 0.0);
+                }
+                s as usize
+            }) as CFTypeRef;
+            // Keep a drag a drag when it crosses the viewer's edge.
+            let held = |b| CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, b);
+            let (kind, button) = if held(0) {
+                (kCGEventLeftMouseDragged, 0)
+            } else if held(1) {
+                (kCGEventRightMouseDragged, 1)
+            } else if held(2) {
+                (kCGEventOtherMouseDragged, 2)
+            } else {
+                (kCGEventMouseMoved, 0)
+            };
+            let event = CGEventCreateMouseEvent(source, kind, p, button);
+            if !event.is_null() {
+                CGEventPost(kCGHIDEventTap, event);
+                CFRelease(event);
+                return;
+            }
+        }
         CGWarpMouseCursorPosition(p);
-        // Re-associating ends the short freeze macOS applies after a warp.
+        // Re-associating shortens the freeze macOS applies after a warp.
         CGAssociateMouseAndMouseCursorPosition(1);
     }
 }
@@ -471,7 +587,7 @@ fn warp(p: CGPoint) {
 /// Borderless, shadowless window over `rect` with two sublayers (both +1
 /// retained): one showing the frames scaled to fit, and a hidden one above it
 /// for the pointer. Shown without activating vdisplay.
-unsafe fn create_window(rect: CGRect) -> Result<(Id, Id, Id)> {
+unsafe fn create_window(rect: CGRect) -> Result<(Id, Id, Id, Id)> {
     let main_h = CGDisplayBounds(CGMainDisplayID()).size.height;
     let frame = CGRect {
         origin: CGPoint {
@@ -518,8 +634,54 @@ unsafe fn create_window(rect: CGRect) -> Result<(Id, Id, Id)> {
     msg![(); pointer, "setContentsScale:", scale => f64];
     msg![(); layer, "addSublayer:", pointer => Id];
 
+    let overlay = overlay_layer(layer_cls, rect.size, scale)?;
+    msg![(); layer, "addSublayer:", overlay => Id];
+
     msg![(); window, "orderFrontRegardless"];
-    Ok((window, frames, pointer))
+    Ok((window, frames, pointer, overlay))
+}
+
+/// A hidden layer over the whole window (+1 retained) that dims the last
+/// frame and explains that the capture stopped.
+unsafe fn overlay_layer(layer_cls: Id, size: CGSize, scale: f64) -> Result<Id> {
+    let color = |white: f64, alpha: f64| -> Result<Id> {
+        let c: Id = msg![Id; class("NSColor").context("NSColor missing")?,
+            "colorWithWhite:alpha:", white => f64, alpha => f64];
+        Ok(msg![Id; c, "CGColor"])
+    };
+    let dim = alloc_init(layer_cls);
+    msg![(); dim, "setFrame:", CGRect { origin: CGPoint::default(), size } => CGRect];
+    const WIDTH_AND_HEIGHT_SIZABLE: u32 = 2 | 16;
+    msg![(); dim, "setAutoresizingMask:", WIDTH_AND_HEIGHT_SIZABLE => u32];
+    msg![(); dim, "setBackgroundColor:", color(0.0, 0.72)? => Id];
+    msg![(); dim, "setHidden:", 1i8 => i8];
+
+    let text = alloc_init(class("CATextLayer").context("CATextLayer missing")?);
+    let band = 140.0f64.min(size.height);
+    let frame = CGRect {
+        origin: CGPoint {
+            x: 20.0,
+            y: (size.height - band) / 2.0,
+        },
+        size: CGSize {
+            width: (size.width - 40.0).max(0.0),
+            height: band,
+        },
+    };
+    msg![(); text, "setFrame:", frame => CGRect];
+    let message = ns_string(
+        "Screen sharing stopped\n\nReconnect it from the vdisplay menu bar icon,\n\
+         or stop the session (Ctrl-C if you started it in a terminal).",
+    );
+    msg![(); text, "setString:", message => Id];
+    msg![(); text, "setFontSize:", 20.0f64 => f64];
+    msg![(); text, "setForegroundColor:", color(1.0, 1.0)? => Id];
+    msg![(); text, "setAlignmentMode:", ns_string("center") => Id];
+    msg![(); text, "setWrapped:", 1i8 => i8];
+    msg![(); text, "setContentsScale:", scale => f64];
+    msg![(); dim, "addSublayer:", text => Id];
+    release(text);
+    Ok(dim)
 }
 
 /// No-op run on the frame queue by `Drop` to wait for in-flight frames.
@@ -585,13 +747,37 @@ unsafe fn shareable_content() -> Result<Id> {
     if !err.is_null() {
         let reason = nsstring_to_string(msg![Id; err, "localizedDescription"]).unwrap_or_default();
         release(err);
-        bail!("ScreenCaptureKit: {reason} (check Screen Recording permission for your terminal)");
+        bail!("ScreenCaptureKit: {reason} (check Screen Recording permission for your terminal or vdisplay.app)");
     }
     let content = CONTENT.swap(ptr::null_mut(), Ordering::SeqCst);
     if content.is_null() {
         bail!("ScreenCaptureKit returned no shareable content");
     }
     Ok(content)
+}
+
+/// Detaches `output` from `stream` before both are released, so no late
+/// frame or delegate call reaches a freed output object.
+unsafe fn detach_output(stream: Id, output: Id) {
+    if stream.is_null() || output.is_null() {
+        return;
+    }
+    let mut err: Id = ptr::null_mut();
+    let _: i8 = msg![i8; stream, "removeStreamOutput:type:error:",
+        output => Id, 0isize => isize, &mut err as *mut Id => *mut Id];
+}
+
+/// Finds `display` in ScreenCaptureKit and starts capturing it.
+unsafe fn capture(
+    display: CGDirectDisplayID,
+    pixels: (u32, u32),
+    fps: f64,
+    queue: Id,
+) -> Result<(Id, Id)> {
+    let sc_display = find_sc_display(display)?;
+    let started = start_stream(sc_display, pixels, fps, queue);
+    release(sc_display);
+    started
 }
 
 /// Starts capturing `sc_display` at `pixels` and up to `fps`, frames delivered
@@ -622,14 +808,16 @@ unsafe fn start_stream(
     };
     msg![(); config, "setMinimumFrameInterval:", interval => CMTime];
 
+    // The output object is also the delegate, to hear when the capture stops.
+    let output = alloc_init(output_class()?);
     let stream: Id = msg![Id; msg![Id; class("SCStream").context("SCStream missing")?, "alloc"],
-        "initWithFilter:configuration:delegate:", filter => Id, config => Id, ptr::null_mut::<c_void>() => Id];
+        "initWithFilter:configuration:delegate:", filter => Id, config => Id, output => Id];
     release(filter);
     release(config);
     if stream.is_null() {
+        release(output);
         bail!("could not create the ScreenCaptureKit stream");
     }
-    let output = alloc_init(output_class()?);
     let mut err: Id = ptr::null_mut();
     let ok: i8 = msg![i8; stream, "addStreamOutput:type:sampleHandlerQueue:error:",
         output => Id, 0isize => isize, queue => Id, &mut err as *mut Id => *mut Id];
@@ -647,7 +835,7 @@ unsafe fn start_stream(
     Ok((stream, output))
 }
 
-/// Runtime class implementing `SCStreamOutput`.
+/// Runtime class implementing `SCStreamOutput` and `SCStreamDelegate`.
 unsafe fn output_class() -> Result<Id> {
     const NAME: &str = "VDisplayStreamOutput";
     if let Some(cls) = class(NAME) {
@@ -669,13 +857,28 @@ unsafe fn output_class() -> Result<Id> {
         did_output as *const c_void,
         types.as_ptr(),
     );
-    let proto = CString::new("SCStreamOutput")?;
-    let proto = objc_getProtocol(proto.as_ptr());
-    if !proto.is_null() {
-        class_addProtocol(cls, proto);
+    let types = CString::new("v@:@@")?;
+    class_addMethod(
+        cls,
+        sel("stream:didStopWithError:"),
+        did_stop as *const c_void,
+        types.as_ptr(),
+    );
+    for proto in ["SCStreamOutput", "SCStreamDelegate"] {
+        let proto = CString::new(proto)?;
+        let proto = objc_getProtocol(proto.as_ptr());
+        if !proto.is_null() {
+            class_addProtocol(cls, proto);
+        }
     }
     objc_registerClassPair(cls);
     Ok(cls)
+}
+
+/// `-[SCStreamDelegate stream:didStopWithError:]`, on a ScreenCaptureKit
+/// queue: the main loop picks it up in `Viewer::tick`.
+unsafe extern "C" fn did_stop(_this: Id, _cmd: Sel, _stream: Id, _err: Id) {
+    CAPTURE_STOPPED.store(true, Ordering::SeqCst);
 }
 
 /// `-[SCStreamOutput stream:didOutputSampleBuffer:ofType:]`, on the frame
