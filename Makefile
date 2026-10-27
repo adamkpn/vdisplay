@@ -113,7 +113,7 @@ app: build notices ## Menu bar app bundle for this Mac (target/release/vdisplay.
 	$(call bundle,target/release/vdisplay,$(APP))
 	@echo "built $(APP) (signed: $(SIGN_IDENTITY))"
 
-icon: ## Redraw packaging/AppIcon.icns from packaging/make-icon.swift (needs Xcode CLT)
+icon: ## Redraw packaging/AppIcon.icns and docs/icon.png from packaging/make-icon.swift (needs Xcode CLT)
 	@rm -rf $(ICONSET) && mkdir -p $(ICONSET)
 	swift packaging/make-icon.swift target/icon/icon-1024.png
 	@for s in 16 32 128 256 512; do \
@@ -122,7 +122,8 @@ icon: ## Redraw packaging/AppIcon.icns from packaging/make-icon.swift (needs Xco
 		sips -z $$d $$d target/icon/icon-1024.png --out $(ICONSET)/icon_$${s}x$${s}@2x.png >/dev/null || exit 1; \
 	done
 	iconutil -c icns $(ICONSET) -o packaging/AppIcon.icns
-	@echo "wrote packaging/AppIcon.icns"
+	sips -z 256 256 target/icon/icon-1024.png --out docs/icon.png >/dev/null
+	@echo "wrote packaging/AppIcon.icns and docs/icon.png (README)"
 
 signing-cert: ## Create a self-signed signing certificate (login keychain) so permissions survive rebuilds
 	@if security find-identity -p codesigning 2>/dev/null | grep -q '"$(SIGN_CERT)"'; then \

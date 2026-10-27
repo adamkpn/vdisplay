@@ -3,9 +3,10 @@
 # run it manually to build without publishing (the files are uploaded as an
 # artifact either way).
 #
-# Three jobs, so third-party build code never shares a runner with write
-# access: `build` compiles with a read-only token and no secrets; `publish`
-# and `tap` only download the finished files.
+# Third-party build code never shares a runner with write access: `build`
+# compiles with a read-only token and no secrets; `publish` and `tap` only
+# download the finished files. `security` (security.yml) must pass too, so
+# every published release was scanned when it was made.
 name: Release
 
 on:
@@ -66,8 +67,13 @@ jobs:
             target/dist/*.sha256
           if-no-files-found: error
 
+  security:
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+
   publish:
-    needs: build
+    needs: [build, security]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
