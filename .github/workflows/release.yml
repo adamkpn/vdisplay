@@ -1,6 +1,11 @@
-# Builds a universal macOS binary and publishes it as a GitHub release.
-# Push a tag matching the Cargo.toml version (v0.1.0) to release; run it
-# manually to build without publishing (the tarball is uploaded as an artifact).
+# Builds the universal macOS release files and publishes them as a GitHub
+# release. Push a tag matching the Cargo.toml version (v0.2.0) to release;
+# run it manually to build without publishing (the files are uploaded as an
+# artifact either way).
+#
+# Three jobs, so third-party build code never shares a runner with write
+# access: `build` compiles with a read-only token and no secrets; `publish`
+# and `tap` only download the finished files.
 name: Release
 
 on:
@@ -14,12 +19,16 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  # Pinned so a release is built by a known compiler; bump deliberately.
+  RUST_VERSION: "1.99.1"
+
 jobs:
-  release:
+  build:
     runs-on: macos-15
     timeout-minutes: 30
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -27,10 +36,10 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal \
+          rustup toolchain install "$RUST_VERSION" --profile minimal \
             --component clippy,rustfmt \
             --target aarch64-apple-darwin,x86_64-apple-darwin
-          rustup default stable
+          rustup default "$RUST_VERSION"
 
       - name: Check tag matches Cargo.toml version
         if: github.ref_type == 'tag'
@@ -44,24 +53,57 @@ jobs:
       - name: Verify (fmt, clippy, test, build)
         run: make verify
 
-      - name: Build universal binary
+      - name: Build release files
         run: make dist
 
+      - name: Upload release files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vdisplay-macos-universal
+          path: |
+            target/dist/*.tar.gz
+            target/dist/*.zip
+            target/dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vdisplay-macos-universal
+          path: dist
+
       - name: Publish GitHub release
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            target/dist/*.tar.gz target/dist/*.tar.gz.sha256 \
+            dist/*.tar.gz dist/*.zip dist/*.sha256 \
             --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
 
-      # Points Formula/vdisplay.rb in <owner>/homebrew-tap at this release.
-      # HOMEBREW_TAP_DEPLOY_KEY is a deploy key with write access to the tap
-      # repo only; without it the step is skipped.
+  # Points Formula/vdisplay.rb (tarball) and Casks/vdisplay.rb (app zip) in
+  # <owner>/homebrew-tap at this release; both install the CLI and the app.
+  # HOMEBREW_TAP_DEPLOY_KEY is a deploy key with write access to the tap repo
+  # only, and only this job sees it; without it the job is skipped.
+  tap:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vdisplay-macos-universal
+          path: dist
+
       - name: Update Homebrew tap
-        if: github.ref_type == 'tag'
         env:
           TAP_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           TAP_REPO: ${{ github.repository_owner }}/homebrew-tap
@@ -71,35 +113,30 @@ jobs:
             exit 0
           fi
           version="${GITHUB_REF_NAME#v}"
-          sha=$(cut -d ' ' -f 1 "target/dist/vdisplay-$version-macos-universal.tar.gz.sha256")
+          tar_sha=$(cut -d ' ' -f 1 "dist/vdisplay-$version-macos-universal.tar.gz.sha256")
+          zip_sha=$(cut -d ' ' -f 1 "dist/vdisplay-$version-macos-app.zip.sha256")
           ssh_dir="$RUNNER_TEMP/tap-ssh"
           mkdir -m 700 "$ssh_dir"
+          trap 'rm -rf "$ssh_dir"' EXIT
           (umask 077 && printf '%s\n' "$TAP_KEY" > "$ssh_dir/key")
           # GitHub's published host key (api.github.com/meta), not trust-on-first-use.
           echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$ssh_dir/known_hosts"
           export GIT_SSH_COMMAND="ssh -i $ssh_dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$ssh_dir/known_hosts -o StrictHostKeyChecking=yes"
           git clone --depth 1 "git@github.com:$TAP_REPO.git" "$RUNNER_TEMP/tap"
           cd "$RUNNER_TEMP/tap"
-          sed -i '' -E \
+          sed -i -E \
             -e "s|/download/v[^/]+/vdisplay-[^/]+-macos-universal|/download/v$version/vdisplay-$version-macos-universal|" \
-            -e "s|sha256 \"[0-9a-f]+\"|sha256 \"$sha\"|" \
+            -e "s|^  sha256 \"[0-9a-f]+\"|  sha256 \"$tar_sha\"|" \
             Formula/vdisplay.rb
+          sed -i -E \
+            -e "s|^  version \"[^\"]+\"|  version \"$version\"|" \
+            -e "s|^  sha256 \"[0-9a-f]+\"|  sha256 \"$zip_sha\"|" \
+            Casks/vdisplay.rb
           if git diff --quiet; then
-            echo "Formula already at $version"
+            echo "Formula and cask already at $version"
             exit 0
           fi
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
               commit -am "vdisplay $version"
           git push
-          rm -rf "$ssh_dir"
-
-      - name: Upload build artifact
-        if: github.ref_type != 'tag'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: vdisplay-macos-universal
-          path: |
-            target/dist/*.tar.gz
-            target/dist/*.tar.gz.sha256
-          if-no-files-found: error

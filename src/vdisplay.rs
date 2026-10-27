@@ -21,6 +21,9 @@ pub struct DisplayConfig {
     pub ppi: f64,
 }
 
+/// Vendor ID of displays vdisplay creates (`DisplayInfo::ours`).
+pub const VENDOR_ID: u32 = 0xF0F0;
+
 pub struct VirtualDisplay {
     display: Id,
     descriptor: Id,
@@ -54,7 +57,7 @@ impl VirtualDisplay {
             };
             msg![(); descriptor, "setSizeInMillimeters:", mm => CGSize];
             // Stable IDs per resolution so macOS remembers the arrangement.
-            msg![(); descriptor, "setVendorID:", 0xF0F0u32 => u32];
+            msg![(); descriptor, "setVendorID:", VENDOR_ID => u32];
             msg![(); descriptor, "setProductID:", 0x1D15u32 => u32];
             let serial = px_w.wrapping_mul(10_007) ^ px_h ^ (scale << 30);
             msg![(); descriptor, "setSerialNum:", serial => u32];
@@ -154,6 +157,8 @@ pub struct DisplayInfo {
     pub builtin: bool,
     pub main: bool,
     pub mirrors: Option<CGDirectDisplayID>,
+    /// A virtual display made by vdisplay.
+    pub ours: bool,
 }
 
 pub fn list_displays() -> Vec<DisplayInfo> {
@@ -190,6 +195,7 @@ pub fn list_displays() -> Vec<DisplayInfo> {
                     builtin: CGDisplayIsBuiltin(id) != 0,
                     main: id == main,
                     mirrors: (m != 0).then_some(m),
+                    ours: CGDisplayVendorNumber(id) == VENDOR_ID,
                 }
             })
             .collect()

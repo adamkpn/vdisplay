@@ -3,7 +3,12 @@
 mod ffi;
 mod launch;
 mod layout;
+mod menubar;
 mod objc;
+mod prefs;
+mod service;
+mod sessions;
+mod settings;
 mod suggest;
 mod vdisplay;
 mod viewer;
@@ -13,7 +18,6 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 use vdisplay::{DisplayConfig, VirtualDisplay};
 
@@ -38,6 +42,23 @@ enum Cmd {
         #[arg(short, long)]
         display: Option<u32>,
     },
+    /// Run the menu bar app (the default when started as vdisplay.app).
+    Menu,
+    /// Start the menu bar app at login (LaunchAgent).
+    Service {
+        #[command(subcommand)]
+        action: ServiceCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Install the LaunchAgent and start the menu bar app now.
+    Install,
+    /// Stop the menu bar app and remove the LaunchAgent.
+    Uninstall,
+    /// Show whether the LaunchAgent is installed and running.
+    Status,
 }
 
 #[derive(Args)]
@@ -189,18 +210,33 @@ fn real_main() -> Result<()> {
     if !cfg!(target_os = "macos") {
         bail!("vdisplay only runs on macOS");
     }
+    // Opened as vdisplay.app (Finder, `open`, Login Items): no arguments, or
+    // only the process serial number older macOS versions pass.
+    let opened_as_app = std::env::args_os()
+        .skip(1)
+        .all(|a| a.to_string_lossy().starts_with("-psn_"))
+        && std::env::current_exe().is_ok_and(|p| service::in_app_bundle(&p));
+    if opened_as_app {
+        return menubar::run(install_stop_handler()?);
+    }
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Menu => menubar::run(install_stop_handler()?),
+        Cmd::Service { action } => match action {
+            ServiceCmd::Install => service::cmd_install(),
+            ServiceCmd::Uninstall => service::cmd_uninstall(),
+            ServiceCmd::Status => service::cmd_status(),
+        },
         Cmd::List => cmd_list(),
         Cmd::Suggest { display } => cmd_suggest(display),
         Cmd::Create(d) => {
-            let stop = install_ctrlc()?;
-            let mut session = setup_display(&d, &stop)?;
+            let stop = install_stop_handler()?;
+            let mut session = setup_display(&d, stop)?;
             println!(
                 "Virtual display {} ready. Press Ctrl-C to remove it.",
                 session.vd.id
             );
-            wait_loop(&stop, &mut session, || true);
+            wait_loop(stop, &mut session, || true);
             println!("\nRemoving virtual display {}", session.vd.id);
             Ok(())
         }
@@ -218,12 +254,44 @@ struct Session {
     view_rect: Option<ffi::CGRect>,
 }
 
-fn install_ctrlc() -> Result<Arc<AtomicBool>> {
-    let stop = Arc::new(AtomicBool::new(false));
-    let s = stop.clone();
-    ctrlc::set_handler(move || s.store(true, Ordering::SeqCst))
-        .context("installing Ctrl-C handler")?;
-    Ok(stop)
+/// Set by SIGINT (Ctrl-C) and SIGTERM (Stop in the menu bar app, logout,
+/// `launchctl bootout`): every wait loop checks it and cleans up.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Only an atomic store: async-signal-safe.
+extern "C" fn on_stop_signal(_: i32) {
+    STOP.store(true, Ordering::SeqCst);
+}
+
+/// The environment variable a session started by the menu bar app gets: the
+/// app's pid.
+pub const PARENT_ENV: &str = "VDISPLAY_PARENT_PID";
+
+fn install_stop_handler() -> Result<&'static AtomicBool> {
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    const SIG_ERR: usize = usize::MAX;
+    for sig in [SIGINT, SIGTERM] {
+        if unsafe { ffi::signal(sig, on_stop_signal) } == SIG_ERR {
+            bail!("could not install the signal handler for signal {sig}");
+        }
+    }
+    // A session of the menu bar app ends with it, also when it crashes or is
+    // force-quit: otherwise its display and viewer would stay with no way
+    // to stop them.
+    if let Some(parent) = std::env::var(PARENT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+    {
+        std::thread::spawn(move || loop {
+            if unsafe { ffi::getppid() } != parent {
+                STOP.store(true, Ordering::SeqCst);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        });
+    }
+    Ok(&STOP)
 }
 
 fn wait_loop(stop: &AtomicBool, session: &mut Session, keep_going: impl Fn() -> bool) {
@@ -376,8 +444,9 @@ fn require_accessibility() -> Result<()> {
     if !window::is_trusted(true) {
         bail!(
             "Accessibility permission is required to move other apps' windows.\n\
-             Grant it to your terminal in System Settings > Privacy & Security > Accessibility, \
-             then restart the terminal and run again."
+             Grant it to your terminal (or to vdisplay.app for the menu bar app) in \
+             System Settings > Privacy & Security > Accessibility (called Device Control and \
+             Data Access on newer macOS), then restart it and run again."
         );
     }
     Ok(())
@@ -386,19 +455,17 @@ fn require_accessibility() -> Result<()> {
 fn cmd_run(r: RunArgs) -> Result<()> {
     require_accessibility()?;
     let app_path = launch::resolve_app(&r.app)?;
-    let stop = install_ctrlc()?;
-    let mut session = setup_display(&r.display, &stop)?;
+    let stop = install_stop_handler()?;
+    let mut session = setup_display(&r.display, stop)?;
 
     let app = launch::launch(&app_path, &r.app_args, r.new_instance)?;
     println!("Launched {} (pid {})", app.path, app.pid);
     app.activate();
 
-    let win = window::wait_for_window(
-        app.pid,
-        Duration::from_secs(r.window_timeout),
-        &stop,
-        || app.is_alive(),
-    )?;
+    let win =
+        window::wait_for_window(app.pid, Duration::from_secs(r.window_timeout), stop, || {
+            app.is_alive()
+        })?;
     let bounds = session.vd.bounds(); // re-read: mirroring may have rearranged displays
     window::place_window(&win, bounds, !r.no_fullscreen)?;
     println!(
@@ -423,7 +490,7 @@ fn cmd_run(r: RunArgs) -> Result<()> {
     );
 
     let keep_alive = r.keep_alive;
-    wait_loop(&stop, &mut session, || keep_alive || app.is_alive());
+    wait_loop(stop, &mut session, || keep_alive || app.is_alive());
     if app.is_alive() {
         println!("\nTaking the window out of full screen");
         if let Err(e) = window::release_window(&win, session.view_rect) {
@@ -556,6 +623,9 @@ fn cmd_list() -> Result<()> {
         }
         if let Some(m) = d.mirrors {
             flags.push(format!("mirrors {m}"));
+        }
+        if d.ours {
+            flags.push("vdisplay".to_string());
         }
         println!(
             "{:<12} {:<22} {:<14} {:<7} {}",
