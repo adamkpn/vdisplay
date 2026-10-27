@@ -1,6 +1,6 @@
 [package]
 name = "vdisplay"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Run any macOS app on a virtual display of any resolution and show it in part of your screen"
 license = "MIT"

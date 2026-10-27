@@ -61,7 +61,7 @@ Both link `vdisplay` into Homebrew's `bin`, so they can't be installed side by s
 Get the universal binary from the [latest release](../../releases/latest):
 
 ```bash
-VERSION=0.2.0
+VERSION=0.2.1
 curl -LO https://github.com/adamkpn/vdisplay/releases/download/v$VERSION/vdisplay-$VERSION-macos-universal.tar.gz
 curl -LO https://github.com/adamkpn/vdisplay/releases/download/v$VERSION/vdisplay-$VERSION-macos-universal.tar.gz.sha256
 shasum -a 256 -c vdisplay-$VERSION-macos-universal.tar.gz.sha256
