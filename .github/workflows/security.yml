@@ -34,7 +34,19 @@ jobs:
           # Gitleaks scans every commit, not just the last one.
           fetch-depth: 0
 
+      # Compiling cargo-audit takes ~3 minutes; the scans themselves ~20 s.
+      # Keyed on the version, so a version bump builds it once again.
+      # (Release builds are deliberately not cached: their binaries are
+      # always compiled from source.)
+      - name: Restore cargo-audit
+        id: cargo-audit
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ env.CARGO_AUDIT_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install cargo-audit
+        if: steps.cargo-audit.outputs.cache-hit != 'true'
         run: cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
 
       - name: Scan
